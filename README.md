@@ -1,5 +1,7 @@
 # PlayFusion
 
+![PlayFusion main menu](assets/playfusion-main-menu.png)
+
 PlayFusion is a controller-friendly gaming and media operating system based on
 [Kazeta](https://github.com/kazetaos/kazeta) and
 [Kazeta+](https://github.com/the-outcaster/kazeta-plus).

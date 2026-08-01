@@ -1,0 +1,138 @@
+#!/bin/bash
+set -euo pipefail
+
+CONFIG_PATH="${1:-}"
+GAME_ROOT="${2:-}"
+MODE="${3:-auto}"
+
+if [[ -z "$CONFIG_PATH" || -z "$GAME_ROOT" ]]; then
+    echo "Usage: $0 RETROARCH_CONFIG GAME_ROOT [auto|true|false]" >&2
+    exit 2
+fi
+
+mode=$(printf '%s' "$MODE" | tr '[:upper:]' '[:lower:]')
+case "$mode" in
+    0|false|no|off)
+        is_wii=true
+        apply_profile=false
+        ;;
+    1|true|yes|on)
+        is_wii=true
+        apply_profile=true
+        ;;
+    auto|"")
+        is_wii=false
+        apply_profile=false
+        if find "$GAME_ROOT" -maxdepth 3 -type f \
+            \( -iname '*.wbfs' -o -iname '*.wad' \) \
+            -print -quit 2>/dev/null | grep -q .; then
+            is_wii=true
+            apply_profile=true
+        else
+            while IFS= read -r -d '' image; do
+                # Wii disc images contain 5d1c9ea3 at byte offset 0x18.
+                magic=$(od -An -tx1 -j 24 -N 4 -- "$image" 2>/dev/null |
+                    tr -d '[:space:]')
+                if [[ "$magic" == "5d1c9ea3" ]]; then
+                    is_wii=true
+                    apply_profile=true
+                    break
+                fi
+            done < <(find "$GAME_ROOT" -maxdepth 3 -type f -iname '*.iso' -print0 2>/dev/null)
+        fi
+
+        # Existing sideways-Wii profiles are also safe to normalize.
+        if [[ "$apply_profile" == false && -f "$CONFIG_PATH" ]] &&
+            grep -Eq '^[[:space:]]*input_libretro_device_p1[[:space:]]*=[[:space:]]*"513"' \
+                "$CONFIG_PATH"; then
+            is_wii=true
+            apply_profile=true
+        fi
+        ;;
+    *)
+        echo "Unknown WiiGamepad value: $MODE" >&2
+        exit 2
+        ;;
+esac
+
+[[ "$is_wii" == true ]] || exit 0
+[[ -f "$CONFIG_PATH" ]] || {
+    echo "Wii defaults skipped; RetroArch config is missing: $CONFIG_PATH" >&2
+    exit 0
+}
+
+if [[ ! -e "${CONFIG_PATH}.before-wii-gamepad-default" ]]; then
+    cp -a -- "$CONFIG_PATH" "${CONFIG_PATH}.before-wii-gamepad-default"
+fi
+
+set_value() {
+    local key="$1"
+    local value="$2"
+    if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$CONFIG_PATH"; then
+        sed -i -E \
+            "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" \
+            "$CONFIG_PATH"
+    else
+        printf '%s = "%s"\n' "$key" "$value" >> "$CONFIG_PATH"
+    fi
+}
+
+# Vulkan is the permanent default for Wii games. This is independent of the
+# controller choice, so WiiGamepad=false keeps real Wii Remote controls while
+# still using Vulkan.
+set_value video_driver vulkan
+
+# Avoid synchronous shader-compilation stalls when a Wii game first displays
+# a new effect. Mode 3 compiles asynchronously and skips only the affected
+# draw until its shader is ready; the cache is then preloaded on later boots.
+CORE_OPTIONS_PATH="$(dirname -- "$CONFIG_PATH")/retroarch-core-options.cfg"
+touch "$CORE_OPTIONS_PATH"
+if [[ ! -e "${CORE_OPTIONS_PATH}.before-wii-performance-defaults" ]]; then
+    cp -a -- "$CORE_OPTIONS_PATH" \
+        "${CORE_OPTIONS_PATH}.before-wii-performance-defaults"
+fi
+
+set_core_value() {
+    local key="$1"
+    local value="$2"
+    if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$CORE_OPTIONS_PATH"; then
+        sed -i -E \
+            "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = \"${value}\"|" \
+            "$CORE_OPTIONS_PATH"
+    else
+        printf '%s = "%s"\n' "$key" "$value" >> "$CORE_OPTIONS_PATH"
+    fi
+}
+
+set_core_value dolphin_shader_compilation_mode 3
+set_core_value dolphin_wait_for_shaders enabled
+set_core_value dolphin_cpu_core 1
+set_core_value dolphin_main_cpu_thread enabled
+set_core_value dolphin_fastmem enabled
+set_core_value dolphin_fastmem_arena enabled
+
+if [[ "$apply_profile" == false ]]; then
+    echo "Applied the default Wii Vulkan and performance profile to $CONFIG_PATH"
+    exit 0
+fi
+
+set_value input_libretro_device_p1 1
+set_value input_player1_analog_dpad_mode 1
+
+# Counter-rotate Dolphin's sideways Wii Remote directions.
+set_value input_player1_up_btn 13
+set_value input_player1_down_btn 14
+set_value input_player1_left_btn 12
+set_value input_player1_right_btn 11
+set_value input_player1_l_x_plus_axis -1
+set_value input_player1_l_x_minus_axis +1
+set_value input_player1_l_y_plus_axis -0
+set_value input_player1_l_y_minus_axis +0
+
+# Xbox layout verified in-game: swap X/Y and swap A/B.
+set_value input_player1_x_btn 3
+set_value input_player1_b_btn 2
+set_value input_player1_y_btn 1
+set_value input_player1_a_btn 0
+
+echo "Applied the default Wii Vulkan, performance, and Xbox gamepad profile to $CONFIG_PATH"

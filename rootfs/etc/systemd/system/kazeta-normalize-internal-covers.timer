@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically normalize Kazeta internal-game covers
+
+[Timer]
+OnBootSec=10s
+OnUnitActiveSec=30s
+Unit=kazeta-normalize-internal-covers.service
+
+[Install]
+WantedBy=timers.target

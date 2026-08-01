@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEVICE="${SUPER_KAZETA_DVD_DEVICE:-/dev/sr0}"
+INPUT_CONFIG="/etc/super-kazeta/mpv-dvd-input.conf"
+LOG_FILE="/var/kazeta/state/dvd-player.log"
+
+exec /usr/bin/mpv \
+    --no-config \
+    --fullscreen \
+    --force-window=yes \
+    --input-gamepad=yes \
+    --input-conf="$INPUT_CONFIG" \
+    --dvd-device="$DEVICE" \
+    --hwdec=auto-safe \
+    --vo=gpu-next \
+    --gpu-api=vulkan \
+    --osd-level=1 \
+    --osd-bar=yes \
+    --log-file="$LOG_FILE" \
+    dvd://longest

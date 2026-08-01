@@ -1,0 +1,1222 @@
+#!/bin/bash
+set -euo pipefail
+
+LIBRARY_DIR="/var/kazeta/internal-games"
+STORAGE_DIR="/var/kazeta/storage"
+STORAGE_LABEL="PLAYFUSION_GAMES"
+OPTICAL_CART="/run/media/kazeta-optical"
+OPTICAL_STATE="/run/kazeta/optical"
+FIRMWARE_DIR="/var/kazeta/firmware"
+PROGRESS_FILE="/run/kazeta/operation-progress"
+
+fail() {
+    echo "Error: $*" >&2
+    exit 1
+}
+
+emit_progress() {
+    local percent=${1:-0}
+    local phase=${2:-WORKING}
+
+    [[ "$percent" =~ ^[0-9]+$ ]] || percent=0
+    (( percent < 0 )) && percent=0
+    (( percent > 100 )) && percent=100
+    phase=$(safe_title "$phase")
+    mkdir -p "$(dirname "$PROGRESS_FILE")"
+    printf '%s\t%s\n' "$percent" "$phase" > "$PROGRESS_FILE.tmp.$$"
+    chmod 0644 "$PROGRESS_FILE.tmp.$$"
+    mv -f "$PROGRESS_FILE.tmp.$$" "$PROGRESS_FILE"
+    printf 'PF_PROGRESS\t%s\t%s\n' "$percent" "$phase"
+}
+
+copy_file_with_progress() {
+    local source=$1 destination=$2 total=$3 phase=$4
+    local line current percent
+
+    [[ "$total" =~ ^[0-9]+$ && "$total" -gt 0 ]] ||
+        fail "Unable to determine copy size"
+    emit_progress 0 "$phase"
+    if ! dd if="$source" of="$destination" bs=4M conv=fsync status=progress 2>&1 |
+        stdbuf -oL tr '\r' '\n' |
+        while IFS= read -r line; do
+            current=${line%% *}
+            if [[ "$current" =~ ^[0-9]+$ ]]; then
+                percent=$((current * 100 / total))
+                emit_progress "$percent" "$phase"
+            elif [[ -n "$line" ]]; then
+                printf '%s\n' "$line" >&2
+            fi
+        done; then
+        return 1
+    fi
+    emit_progress 100 "$phase"
+}
+
+copy_tree_with_progress() {
+    local source=$1 destination=$2 phase=$3
+    local dereference_links=${4:-false}
+    local line percent
+    local -a rsync_options=(-a --no-inc-recursive --info=progress2)
+
+    command -v rsync >/dev/null 2>&1 || fail "rsync is missing"
+    [[ "$dereference_links" != true ]] || rsync_options+=(-L)
+    emit_progress 0 "$phase"
+    if ! rsync "${rsync_options[@]}" \
+        "$source/." "$destination/" 2>&1 |
+        stdbuf -oL tr '\r' '\n' |
+        while IFS= read -r line; do
+            percent=$(printf '%s\n' "$line" |
+                grep -oE '[0-9]{1,3}%' | tail -n 1 | tr -d '%' || true)
+            if [[ "$percent" =~ ^[0-9]+$ ]]; then
+                emit_progress "$percent" "$phase"
+            elif [[ -n "$line" ]]; then
+                printf '%s\n' "$line" >&2
+            fi
+        done; then
+        return 1
+    fi
+    emit_progress 100 "$phase"
+}
+
+percent_command_with_progress() {
+    local phase=$1
+    shift
+    local line percent
+
+    emit_progress 0 "$phase"
+    if ! "$@" 2>&1 |
+        stdbuf -oL tr '\r' '\n' |
+        while IFS= read -r line; do
+            percent=$(printf '%s\n' "$line" |
+                grep -oE '[0-9]{1,3}([.][0-9]+)?%' |
+                tail -n 1 | tr -d '%' | cut -d. -f1 || true)
+            if [[ "$percent" =~ ^[0-9]+$ ]]; then
+                emit_progress "$percent" "$phase"
+            elif [[ -n "$line" ]]; then
+                printf '%s\n' "$line" >&2
+            fi
+        done; then
+        return 1
+    fi
+    emit_progress 100 "$phase"
+}
+
+burn_command_with_progress() {
+    local line percent
+    local finalizing=0
+
+    emit_progress 0 "PREPARING DISC"
+    if ! "$@" 2>&1 |
+        stdbuf -oL tr '\r' '\n' |
+        while IFS= read -r line; do
+            percent=$(printf '%s\n' "$line" |
+                grep -oE '[0-9]{1,3}([.][0-9]+)?%' |
+                tail -n 1 | tr -d '%' | cut -d. -f1 || true)
+            if [[ "$percent" =~ ^[0-9]+$ ]]; then
+                if (( finalizing || percent >= 100 )); then
+                    finalizing=1
+                    emit_progress 100 "FINALIZING DISC"
+                else
+                    emit_progress "$percent" "BURNING DISC"
+                fi
+            elif [[ -n "$line" ]]; then
+                printf '%s\n' "$line" >&2
+            fi
+        done; then
+        return 1
+    fi
+    emit_progress 100 "FINALIZING DISC"
+}
+
+valid_id() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+validate_relative_file() {
+    local root="$1"
+    local relative="$2"
+    [[ -n "$relative" ]] || fail "Empty path in KZI file"
+    [[ "$relative" != /* ]] || fail "Absolute paths are not allowed"
+    local resolved
+    resolved=$(realpath -e -- "$root/$relative") || fail "Missing file: $relative"
+    [[ "$resolved" == "$root/"* ]] || fail "Path leaves the game folder: $relative"
+}
+
+validate_optional_relative_file() {
+    local root="$1"
+    local relative="$2"
+    [[ -n "$relative" ]] || return 0
+    [[ "$relative" != /* ]] || fail "Absolute paths are not allowed"
+    local resolved
+    resolved=$(realpath -m -- "$root/$relative") || fail "Invalid path: $relative"
+    [[ "$resolved" == "$root/"* ]] || fail "Path leaves the game folder: $relative"
+    if [[ -e "$resolved" ]]; then
+        resolved=$(realpath -e -- "$resolved") || fail "Invalid file: $relative"
+        [[ "$resolved" == "$root/"* ]] || fail "Path leaves the game folder: $relative"
+    fi
+}
+
+field_from_kzi() {
+    local key="$1"
+    local kzi="$2"
+    sed -n "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*//p" "$kzi" |
+        head -n 1
+}
+
+system_folder_for_kzi() {
+    local kzi="$1" runtime exec_path game_id value
+    runtime=$(field_from_kzi Runtime "$kzi" | tr '[:upper:]' '[:lower:]')
+    exec_path=$(field_from_kzi Exec "$kzi" | tr '[:upper:]' '[:lower:]')
+    game_id=$(field_from_kzi Id "$kzi" | tr '[:upper:]' '[:lower:]')
+    value="$runtime $exec_path $game_id"
+
+    case "$value" in
+        *playfusion-arcade*|*finalburn*|*mame*) printf 'Arcade\n' ;;
+        *playstation2*|*pcsx2*) printf 'PlayStation 2\n' ;;
+        *playstation*|*duckstation*) printf 'PlayStation\n' ;;
+        *vita3k*) printf 'PlayStation Vita\n' ;;
+        *ppsspp*|*psp-*) printf 'PSP\n' ;;
+        *cemu*|*wii-u*|*wiiu*) printf 'Wii U\n' ;;
+        *dolphin*)
+            case "$value" in
+                *.wbfs*|*.wad*|*wii*) printf 'Wii\n' ;;
+                *) printf 'GameCube\n' ;;
+            esac
+            ;;
+        *nintendo64*|*mupen64*) printf 'Nintendo 64\n' ;;
+        *azahar*|*citra*) printf 'Nintendo 3DS\n' ;;
+        *melonds*) printf 'Nintendo DS\n' ;;
+        *mgba*)
+            case "$exec_path" in
+                *.gba) printf 'Game Boy Advance\n' ;;
+                *) printf 'Game Boy\n' ;;
+            esac
+            ;;
+        *snes*) printf 'SNES\n' ;;
+        *nes*) printf 'NES\n' ;;
+        *dreamcast*) printf 'Dreamcast\n' ;;
+        *segacd*|*sega-cd*) printf 'Sega CD\n' ;;
+        *saturn*) printf 'Sega Saturn\n' ;;
+        *.32x*|*32x*) printf 'Sega 32X\n' ;;
+        *.gg*|*gamegear*) printf 'Game Gear\n' ;;
+        *megadrive*|*genesis*|*picodrive*) printf 'Sega Genesis\n' ;;
+        *dosbox*) printf 'DOS\n' ;;
+        *puae*|*amiga*) printf 'Amiga\n' ;;
+        *vice*|*commodore64*) printf 'Commodore 64\n' ;;
+        *stella*|*atari2600*) printf 'Atari 2600\n' ;;
+        *prosystem*|*atari7800*) printf 'Atari 7800\n' ;;
+        *handy*|*lynx*) printf 'Atari Lynx\n' ;;
+        *xemu*) printf 'Original Xbox\n' ;;
+        *windows*|*scummvm*) printf 'PC Games\n' ;;
+        *) printf 'Other\n' ;;
+    esac
+}
+
+find_library_game() {
+    local root="$1" game_id="$2"
+    find "$root" -mindepth 1 -maxdepth 2 -type d -name "$game_id" \
+        ! -path '*/.*' -print -quit 2>/dev/null
+}
+
+safe_title() {
+    printf '%s' "$1" | tr '\r\n\t' '   ' |
+        sed -E 's/\\x20/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+root_disk() {
+    local source parent
+    source=$(findmnt -nro SOURCE / | head -n 1)
+    source=${source%%\[*}
+    [[ "$source" == /dev/* ]] || fail "Unable to identify the PlayFusion boot disk"
+    # `lsblk -s` prints the oldest ancestor first and the selected partition
+    # last. The first path is therefore the whole boot disk, including when
+    # `/` is an ostree deployment subvolume.
+    parent=$(lsblk -snp -o PATH "$source" 2>/dev/null | head -n 1 | tr -d ' ')
+    [[ -b "$parent" ]] || parent="$source"
+    printf '%s\n' "$parent"
+}
+
+internal_data_disks() {
+    local boot path type removable hotplug readonly transport
+    boot=$(root_disk)
+    while read -r path type removable hotplug readonly transport; do
+        [[ "$type" == disk && "$readonly" == 0 ]] || continue
+        [[ "$removable" == 0 && "$hotplug" == 0 ]] || continue
+        [[ "$transport" != usb ]] || continue
+        [[ "$path" != "$boot" ]] || continue
+        case "$path" in
+            /dev/sd*|/dev/nvme*|/dev/mmcblk*|/dev/vd*) ;;
+            *) continue ;;
+        esac
+        printf '%s\n' "$path"
+    done < <(lsblk -dnro PATH,TYPE,RM,HOTPLUG,RO,TRAN)
+}
+
+validate_internal_data_disk() {
+    local requested="$1" candidate
+    [[ "$requested" == /dev/* ]] || fail "Invalid storage device"
+    requested=$(realpath -e -- "$requested") || fail "Storage device disappeared"
+    while IFS= read -r candidate; do
+        if [[ "$candidate" == "$requested" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(internal_data_disks)
+    fail "The selected device is not an eligible internal data drive"
+}
+
+storage_partition_for_disk() {
+    local disk="$1" partition type label filesystem
+    while read -r partition type; do
+        [[ "$type" == part ]] || continue
+        label=$(blkid -s LABEL -o value "$partition" 2>/dev/null || true)
+        filesystem=$(blkid -s TYPE -o value "$partition" 2>/dev/null || true)
+        if [[ "$label" == "$STORAGE_LABEL" && "$filesystem" == ext4 ]]; then
+            printf '%s\n' "$partition"
+            return 0
+        fi
+    done < <(lsblk -nrpo PATH,TYPE "$disk")
+    return 1
+}
+
+mount_storage_partition() {
+    local partition="$1" disk uuid mount_path existing source_uuid
+    [[ -b "$partition" ]] || fail "Storage partition disappeared"
+    disk="/dev/$(lsblk -nro PKNAME "$partition" | head -n 1)"
+    validate_internal_data_disk "$disk" >/dev/null
+    [[ "$(blkid -s LABEL -o value "$partition" 2>/dev/null)" == "$STORAGE_LABEL" ]] ||
+        fail "Storage partition label is invalid"
+    [[ "$(blkid -s TYPE -o value "$partition" 2>/dev/null)" == ext4 ]] ||
+        fail "PlayFusion storage must use ext4"
+    uuid=$(blkid -s UUID -o value "$partition" 2>/dev/null)
+    [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || fail "Storage UUID is invalid"
+
+    mkdir -p "$STORAGE_DIR"
+    mount_path="$STORAGE_DIR/$uuid"
+    existing=$(findmnt -nro TARGET --source "$partition" | head -n 1 || true)
+    if [[ -n "$existing" && "$existing" != "$mount_path" ]]; then
+        umount "$existing" || fail "Dedicated PlayFusion storage is busy at $existing"
+    fi
+    mkdir -p "$mount_path"
+    if ! mountpoint -q "$mount_path"; then
+        mount -t ext4 -o rw,noatime,nosuid,nodev "$partition" "$mount_path"
+    fi
+    source_uuid=$(findmnt -nro UUID --target "$mount_path" | head -n 1)
+    [[ "$source_uuid" == "$uuid" ]] || fail "Mounted storage UUID verification failed"
+    findmnt -nro OPTIONS --target "$mount_path" | tr ',' '\n' | grep -qx rw ||
+        fail "PlayFusion storage mounted read-only"
+
+    mkdir -p "$mount_path/games" "$mount_path/metadata"
+    printf 'PLAYFUSION_STORAGE_V1\nUUID=%s\n' "$uuid" > "$mount_path/.playfusion-storage"
+    chown gamer:kazetaftp "$mount_path" "$mount_path/games" "$mount_path/metadata" \
+        "$mount_path/.playfusion-storage"
+    chmod 2775 "$mount_path" "$mount_path/games" "$mount_path/metadata"
+    chmod 0664 "$mount_path/.playfusion-storage"
+    printf '%s\n' "$mount_path"
+}
+
+mount_storage_volumes() {
+    local disk partition
+    mkdir -p "$STORAGE_DIR"
+    while IFS= read -r disk; do
+        partition=$(storage_partition_for_disk "$disk" || true)
+        [[ -n "$partition" ]] || continue
+        mount_storage_partition "$partition" >/dev/null
+    done < <(internal_data_disks)
+}
+
+drive_health() {
+    local disk="$1" result
+    if command -v smartctl >/dev/null 2>&1; then
+        result=$(smartctl -H "$disk" 2>/dev/null |
+            sed -n -E 's/.*(PASSED|OK|FAILED).*/\1/p' | head -n 1)
+        [[ -n "$result" ]] && printf '%s\n' "$result" && return 0
+    fi
+    printf 'UNKNOWN\n'
+}
+
+list_storage() {
+    local disk partition uuid mount_path size free model serial health
+    mount_storage_volumes
+    while IFS= read -r disk; do
+        size=$(lsblk -dnro SIZE "$disk" | head -n 1)
+        model=$(safe_title "$(lsblk -dnro MODEL "$disk" | head -n 1)")
+        serial=$(safe_title "$(lsblk -dnro SERIAL "$disk" | head -n 1)")
+        health=$(drive_health "$disk")
+        partition=$(storage_partition_for_disk "$disk" || true)
+        if [[ -n "$partition" ]]; then
+            uuid=$(blkid -s UUID -o value "$partition")
+            mount_path="$STORAGE_DIR/$uuid"
+            free=$(df -h --output=avail "$mount_path" | tail -n 1 | tr -d ' ')
+            printf 'active\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$uuid" "$disk" "$partition" "$size" "$free" \
+                "$model" "$serial" "$health" "$mount_path"
+        else
+            printf 'available\t-\t%s\t-\t%s\t-\t%s\t%s\t%s\t-\n' \
+                "$disk" "$size" "$model" "$serial" "$health"
+        fi
+    done < <(internal_data_disks)
+}
+
+library_path_for_token() {
+    local token="$1" path source uuid
+    if [[ "$token" == system ]]; then
+        printf '%s\n' "$LIBRARY_DIR"
+        return 0
+    fi
+    [[ "$token" =~ ^[A-Za-z0-9-]+$ ]] || fail "Invalid storage UUID"
+    mount_storage_volumes
+    path="$STORAGE_DIR/$token"
+    mountpoint -q "$path" || fail "The selected storage drive is not mounted"
+    source=$(findmnt -nro SOURCE --target "$path" | head -n 1)
+    uuid=$(blkid -s UUID -o value "$source" 2>/dev/null)
+    [[ "$uuid" == "$token" ]] || fail "Storage UUID verification failed"
+    [[ -d "$path/games" ]] || fail "Storage games folder is missing"
+    printf '%s\n' "$path/games"
+}
+
+list_library_targets() {
+    local size free disk partition uuid mount_path model
+    mkdir -p "$LIBRARY_DIR"
+    size=$(df -h --output=size "$LIBRARY_DIR" | tail -n 1 | tr -d ' ')
+    free=$(df -h --output=avail "$LIBRARY_DIR" | tail -n 1 | tr -d ' ')
+    printf 'system\tSYSTEM DRIVE\t%s\t%s\t%s\n' "$size" "$free" "$LIBRARY_DIR"
+    mount_storage_volumes
+    while IFS= read -r disk; do
+        partition=$(storage_partition_for_disk "$disk" || true)
+        [[ -n "$partition" ]] || continue
+        uuid=$(blkid -s UUID -o value "$partition")
+        mount_path="$STORAGE_DIR/$uuid"
+        size=$(df -h --output=size "$mount_path" | tail -n 1 | tr -d ' ')
+        free=$(df -h --output=avail "$mount_path" | tail -n 1 | tr -d ' ')
+        model=$(safe_title "$(lsblk -dnro MODEL "$disk" | head -n 1)")
+        [[ -n "$model" ]] || model="EXPANSION DRIVE"
+        printf '%s\t%s\t%s\t%s\t%s\n' "$uuid" "$model" "$size" "$free" "$mount_path/games"
+    done < <(internal_data_disks)
+}
+
+format_internal_storage() {
+    local requested="$1" disk existing_mount partition uuid
+    disk=$(validate_internal_data_disk "$requested")
+    if storage_partition_for_disk "$disk" >/dev/null; then
+        fail "This drive is already configured as PlayFusion storage"
+    fi
+
+    while IFS= read -r existing_mount; do
+        [[ -n "$existing_mount" ]] && umount "$existing_mount"
+    done < <(lsblk -nrpo MOUNTPOINT "$disk" | sed '/^$/d' | tac)
+
+    wipefs -a -- "$disk" >&2
+    printf 'label: gpt\nstart=2048, type=linux\n' |
+        sfdisk --wipe always "$disk" >&2
+    partprobe "$disk" >&2
+    udevadm settle >&2
+    partition=$(lsblk -nrpo PATH,TYPE "$disk" | awk '$2 == "part" { print $1; exit }')
+    [[ -b "$partition" ]] || fail "The new storage partition did not appear"
+    mkfs.ext4 -F -m 0 -L "$STORAGE_LABEL" "$partition" >&2
+    udevadm settle >&2
+    uuid=$(blkid -s UUID -o value "$partition" 2>/dev/null)
+    [[ "$uuid" =~ ^[A-Za-z0-9-]+$ ]] || fail "The new storage UUID is invalid"
+    mount_storage_partition "$partition" >/dev/null
+    sync
+    printf 'Configured %s as PlayFusion storage (%s)\n' "$disk" "$uuid"
+}
+
+mounted_removable_targets() {
+    local mount_path source source_uuid storage_mount root_source target_parent root_parent
+    while IFS= read -r mount_path; do
+        [[ -n "$mount_path" ]] || continue
+        case "$mount_path" in
+            /run/media/kazeta-optical|/run/media/kazeta-optical/*) continue ;;
+            /run/media/*|/media/*) ;;
+            *) continue ;;
+        esac
+        mountpoint -q "$mount_path" || continue
+        findmnt -nro OPTIONS --target "$mount_path" | tr ',' '\n' | grep -qx rw || continue
+        source=$(findmnt -nro SOURCE --target "$mount_path" | head -n 1)
+        [[ "$source" == /dev/* ]] || continue
+        # A dedicated PlayFusion library may also be auto-mounted below
+        # /run/media by the desktop stack. Do not offer that second mount as
+        # a removable-cart destination: it is already listed once as internal
+        # storage and writing a cart at its root would corrupt the layout.
+        source_uuid=$(blkid -s UUID -o value "$source" 2>/dev/null || true)
+        storage_mount="$STORAGE_DIR/$source_uuid"
+        if [[ -n "$source_uuid" ]] && mountpoint -q "$storage_mount"; then
+            continue
+        fi
+        root_source=$(findmnt -nro SOURCE / | head -n 1)
+        root_source=${root_source%%\[*}
+        target_parent=$(lsblk -nro PKNAME "$source" 2>/dev/null | head -n 1)
+        root_parent=$(lsblk -nro PKNAME "$root_source" 2>/dev/null | head -n 1)
+        if [[ -n "$target_parent" && -n "$root_parent" && "$target_parent" == "$root_parent" ]]; then
+            continue
+        fi
+        printf 'mounted\t%s\t%s\t%s\t%s\t%s\n' \
+            "$mount_path" \
+            "$(lsblk -nro LABEL "$source" 2>/dev/null | head -n 1)" \
+            "$(lsblk -nro SIZE "$source" 2>/dev/null | head -n 1)" \
+            "$(lsblk -nro FSTYPE "$source" 2>/dev/null | head -n 1)" \
+            "$source"
+    done < <(findmnt -rn -o TARGET)
+}
+
+removable_format_disks() {
+    local root_source root_parent path type removable hotplug readonly size transport
+    root_source=$(findmnt -nro SOURCE / | head -n 1)
+    root_source=${root_source%%\[*}
+    root_parent=$(lsblk -nro PKNAME "$root_source" 2>/dev/null | head -n 1)
+    [[ -n "$root_parent" ]] || root_parent=$(basename "$root_source")
+
+    while read -r path type removable hotplug readonly size transport; do
+        [[ "$type" == disk && "$readonly" == 0 ]] || continue
+        [[ "$removable" == 1 || "$hotplug" == 1 || "$transport" == usb ]] || continue
+        [[ "$(basename "$path")" != "$root_parent" ]] || continue
+        [[ "$path" == /dev/sd* || "$path" == /dev/mmcblk* ]] || continue
+        printf 'format\t%s\t\t%s\text4\t%s\n' "$path" "$size" "$path"
+    done < <(lsblk -dnro PATH,TYPE,RM,HOTPLUG,RO,SIZE,TRAN)
+}
+
+blank_disc_capacity_bytes() {
+    local device=$1 sectors
+
+    command -v xorriso >/dev/null 2>&1 || return 1
+    sectors=$(
+        LC_ALL=C xorriso -outdev "$device" -tell_media_space 2>&1 |
+            sed -n -E 's/.*Media space[^0-9]*([0-9]+)s.*/\1/p' |
+            tail -n 1
+    )
+    [[ "$sectors" =~ ^[0-9]+$ && "$sectors" -gt 0 ]] || return 1
+    printf '%s\n' "$((sectors * 2048))"
+}
+
+nominal_blank_disc_capacity_bytes() {
+    local properties=$1
+
+    # Destination discovery runs directly from the controller-driven menu.
+    # Asking xorriso for exact capacity here can block the UI for several
+    # seconds while a USB optical drive spins up. Use the standard capacity
+    # for display and retain the exact xorriso check immediately before burn.
+    if printf '%s\n' "$properties" |
+        grep -Eq '^ID_CDROM_MEDIA_(DVD_PLUS_R_DL|DVD_R_DL)=1$'; then
+        printf '%s\n' 8500000000
+    elif printf '%s\n' "$properties" |
+        grep -Eq '^ID_CDROM_MEDIA_(DVD_PLUS_RW|DVD_RW|DVD_PLUS_R|DVD_R)=1$'; then
+        printf '%s\n' 4700000000
+    elif printf '%s\n' "$properties" |
+        grep -Eq '^ID_CDROM_MEDIA_(CD_RW|CD_R)=1$'; then
+        printf '%s\n' 734003200
+    else
+        return 1
+    fi
+}
+
+blank_optical_targets() {
+    local device properties model media capacity capacity_human
+
+    command -v xorriso >/dev/null 2>&1 || return 0
+    for device in /dev/sr*; do
+        [[ -b "$device" ]] || continue
+        properties=$(udevadm info --query=property --name="$device" 2>/dev/null || true)
+        printf '%s\n' "$properties" | grep -q '^ID_CDROM_MEDIA=1$' || continue
+        printf '%s\n' "$properties" | grep -q '^ID_CDROM_MEDIA_STATE=blank$' || continue
+        printf '%s\n' "$properties" |
+            grep -Eq '^ID_CDROM_(CD_R|CD_RW|DVD_R|DVD_RW|DVD_PLUS_R|DVD_PLUS_RW|DVD_R_DL|DVD_PLUS_R_DL)=1$' ||
+            continue
+        capacity=$(nominal_blank_disc_capacity_bytes "$properties" || true)
+        [[ "$capacity" =~ ^[0-9]+$ && "$capacity" -gt 0 ]] || continue
+        capacity_human=$(numfmt --to=iec-i --suffix=B "$capacity")
+        model=$(safe_title "$(lsblk -dnro MODEL "$device" 2>/dev/null | head -n 1)")
+        media=$(printf '%s\n' "$properties" |
+            sed -n -E 's/^ID_CDROM_MEDIA_(DVD_PLUS_R_DL|DVD_R_DL|DVD_PLUS_RW|DVD_RW|DVD_PLUS_R|DVD_R|CD_RW|CD_R)=1$/\1/p' |
+            head -n 1 | tr '_' '-')
+        printf 'burn\t%s\tBLANK %s\t%s\toptical\t%s\n' \
+            "$device" "${media:-DISC}" "$capacity_human" "${model:-$device}"
+    done
+}
+
+validate_removable_target() {
+    local requested="$1"
+    local candidate
+    while IFS=$'\t' read -r _ candidate _; do
+        if [[ "$candidate" == "$requested" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(mounted_removable_targets)
+    fail "The selected removable drive is no longer mounted and writable"
+}
+
+validate_format_disk() {
+    local requested="$1"
+    local candidate
+    while IFS=$'\t' read -r _ candidate _; do
+        if [[ "$candidate" == "$requested" ]]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done < <(removable_format_disks)
+    fail "The selected device is not a safe removable formatting target"
+}
+
+format_ext4_cart() {
+    local requested="$1"
+    local serial="$2"
+    local disk partition mount_path existing_mount
+
+    disk=$(validate_format_disk "$requested")
+    # Unmount only descendants of the validated removable disk.
+    while IFS= read -r existing_mount; do
+        [[ -n "$existing_mount" ]] && umount "$existing_mount"
+    done < <(lsblk -nrpo MOUNTPOINT "$disk" | sed '/^$/d' | tac)
+
+    wipefs -a -- "$disk" >&2
+    printf 'label: gpt\nstart=2048, type=linux\n' |
+        sfdisk --wipe always "$disk" >&2
+    partprobe "$disk" >&2
+    udevadm settle >&2
+    partition=$(lsblk -nrpo PATH,TYPE "$disk" | awk '$2 == "part" { print $1; exit }')
+    [[ -b "$partition" ]] || fail "The new ext4 partition did not appear"
+
+    existing_mount=$(findmnt -nro TARGET --source "$partition" | head -n 1)
+    [[ -z "$existing_mount" ]] || umount "$existing_mount"
+    mkfs.ext4 -F -L KAZETA_CART "$partition" >&2
+    mount_path="/run/media/kazeta-cart-$serial"
+    mkdir -p "$mount_path"
+    mount -t ext4 -o rw,noatime "$partition" "$mount_path" >&2
+    printf '%s\n' "$mount_path"
+}
+
+disc_estimated_bytes() {
+    local device="$1"
+    local runtime="$2"
+    local stream_size device_size
+    stream_size=$(stat -c %s /run/kazeta/cdstream/disc.bin 2>/dev/null || printf '0')
+    if [[ "$stream_size" -gt 0 ]]; then
+        printf '%s\n' "$stream_size"
+        return 0
+    fi
+    stream_size=$(stat -c %s /run/kazeta/cdstream/disc.iso 2>/dev/null || printf '0')
+    if [[ "$stream_size" -gt 0 ]]; then
+        printf '%s\n' "$stream_size"
+        return 0
+    fi
+    device_size=$(blockdev --getsize64 "$device" 2>/dev/null || printf '0')
+    printf '%s\n' "$device_size"
+}
+
+game_id_exists_anywhere() {
+    local game_id="$1" root
+    [[ -n "$(find_library_game "$LIBRARY_DIR" "$game_id")" ]] && return 0
+    mount_storage_volumes
+    for root in "$STORAGE_DIR"/*/games; do
+        [[ -d "$root" ]] || continue
+        [[ -n "$(find_library_game "$root" "$game_id")" ]] && return 0
+    done
+    return 1
+}
+
+library_game_path() {
+    local game_id=$1 root candidate
+
+    candidate=$(find_library_game "$LIBRARY_DIR" "$game_id")
+    if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+        realpath -e -- "$candidate"
+        return 0
+    fi
+    mount_storage_volumes
+    for root in "$STORAGE_DIR"/*/games; do
+        [[ -d "$root" ]] || continue
+        candidate=$(find_library_game "$root" "$game_id")
+        if [[ -d "$candidate" && ! -L "$candidate" ]]; then
+            realpath -e -- "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+validate_blank_optical_target() {
+    local requested=$1 device
+
+    requested=$(realpath -e -- "$requested") ||
+        fail "The optical drive disappeared"
+    while IFS=$'\t' read -r _ device _; do
+        if [[ "$device" == "$requested" ]]; then
+            printf '%s\n' "$device"
+            return 0
+        fi
+    done < <(blank_optical_targets)
+    fail "The selected optical disc is no longer blank or writable"
+}
+
+burn_internal_game() {
+    local source=$1 requested_device=$2 game_id=$3
+    local device required capacity label mount_path
+
+    device=$(validate_blank_optical_target "$requested_device")
+    required=$(du -sb -- "$source" | cut -f1)
+    capacity=$(blank_disc_capacity_bytes "$device") ||
+        fail "Unable to determine blank-disc capacity"
+    [[ "$required" =~ ^[0-9]+$ ]] || fail "Unable to determine game size"
+    (( capacity > required + 67108864 )) ||
+        fail "The game is too large for this blank disc"
+
+    /usr/bin/kazeta-optical-disc-helper remove >/dev/null 2>&1 || true
+    while IFS= read -r mount_path; do
+        [[ -n "$mount_path" ]] && umount "$mount_path"
+    done < <(findmnt -rn -S "$device" -o TARGET | tac)
+
+    label=$(printf 'PF_%s' "$game_id" |
+        tr '[:lower:]' '[:upper:]' |
+        sed -E 's/[^A-Z0-9_]+/_/g' |
+        cut -c 1-32)
+    [[ -n "$label" ]] || label=PLAYFUSION
+    burn_command_with_progress xorriso \
+        -outdev "$device" \
+        -volid "$label" \
+        -joliet on \
+        -rockridge on \
+        -map "$source" / \
+        -commit \
+        -eject all ||
+        fail "Optical-disc burn failed"
+    sync
+    printf 'Burned %s to %s\n' "$game_id" "$device"
+}
+
+copy_disc_bios() {
+    local runtime="$1"
+    local destination="$2"
+    local found=0
+    mkdir -p "$destination/bios"
+    if [[ -d "$OPTICAL_CART/bios" ]]; then
+        while IFS= read -r -d '' bios; do
+            cp -f -- "$bios" "$destination/bios/"
+            found=1
+        done < <(find -L "$OPTICAL_CART/bios" -maxdepth 1 -type f -print0)
+    fi
+    case "$runtime" in
+        playstation-1.01*|playstation2-1.0*|segacd-1.0*|saturn-1.0*|pcengine-1.0*)
+            [[ "$found" -eq 1 ]] ||
+                fail "The required console BIOS is not installed"
+            ;;
+    esac
+}
+
+rip_optical_disc() {
+    local destination_kind="$1"
+    local requested_target="$2"
+    local selected_id="$3"
+    local kzi device source_id runtime name serial platform final_id exec_value
+    local destination temporary available estimated filesystem image_size library_root system_folder
+    local device_name disc_kind image_tmp toc_tmp source_exec exec_path target_name
+
+    [[ -r "$OPTICAL_CART/cart.kzi" ]] || fail "No recognized console disc is ready"
+    [[ -r "$OPTICAL_STATE/device" ]] || fail "The optical drive state is missing"
+    kzi="$OPTICAL_CART/cart.kzi"
+    device=$(head -n 1 "$OPTICAL_STATE/device")
+    [[ "$device" == /dev/sr* && -b "$device" ]] || fail "Unsafe optical device"
+
+    source_id=$(field_from_kzi Id "$kzi")
+    runtime=$(field_from_kzi Runtime "$kzi")
+    name=$(safe_title "$(field_from_kzi Name "$kzi")")
+    [[ "$source_id" == "$selected_id" ]] || fail "The selected disc changed before installation"
+    case "$runtime" in
+        playstation-1.01*) platform=ps1 ;;
+        playstation2-1.0*) platform=ps2 ;;
+        dolphin-1.0*) platform=dolphin ;;
+        dreamcast-1.0*) platform=dreamcast ;;
+        segacd-1.0*) platform=segacd ;;
+        saturn-1.0*) platform=saturn ;;
+        pcengine-1.0*) platform=pcengine ;;
+        *) fail "This optical runtime cannot be installed yet" ;;
+    esac
+    serial=${source_id#optical-${platform}-}
+    valid_id "$serial" || fail "The disc serial is invalid"
+    exec_value=$(field_from_kzi Exec "$kzi")
+    [[ -n "$exec_value" ]] || fail "The optical cart has no executable image"
+    system_folder=$(system_folder_for_kzi "$kzi")
+
+    case "$destination_kind" in
+        internal)
+            library_root="$LIBRARY_DIR/$system_folder"
+            mkdir -p "$library_root"
+            destination="$library_root/internal-${platform}-${serial}"
+            final_id="internal-${platform}-${serial}"
+            game_id_exists_anywhere "$final_id" &&
+                fail "This disc is already installed in the PlayFusion library"
+            temporary="$library_root/.disc-install-${platform}-${serial}-$$"
+            ;;
+        internal-storage)
+            library_root=$(library_path_for_token "$requested_target")
+            library_root="$library_root/$system_folder"
+            mkdir -p "$library_root"
+            final_id="internal-${platform}-${serial}"
+            game_id_exists_anywhere "$final_id" &&
+                fail "This disc is already installed in the PlayFusion library"
+            temporary="$library_root/.disc-install-${platform}-${serial}-$$"
+            destination="$library_root/$final_id"
+            ;;
+        removable)
+            requested_target=$(realpath -e -- "$requested_target") ||
+                fail "The selected removable drive disappeared"
+            destination=$(validate_removable_target "$requested_target")
+            final_id="portable-${platform}-${serial}"
+            for conflict in cart.kzi game icon.png cover.png cover.jpg; do
+                [[ ! -e "$destination/$conflict" ]] ||
+                    fail "The selected drive already contains Kazeta cart files"
+            done
+            temporary="$destination/.kazeta-disc-build-${platform}-${serial}-$$"
+            ;;
+        format)
+            requested_target=$(realpath -e -- "$requested_target") ||
+                fail "The selected removable device disappeared"
+            destination=$(format_ext4_cart "$requested_target" "$serial")
+            final_id="portable-${platform}-${serial}"
+            temporary="$destination/.kazeta-disc-build-${platform}-${serial}-$$"
+            ;;
+        *) fail "Unknown disc installation destination" ;;
+    esac
+
+    rm -rf -- "$temporary"
+    mkdir -p "$temporary/game"
+    trap 'rm -rf -- "${temporary:-}"' EXIT
+
+    estimated=$(disc_estimated_bytes "$device" "$runtime")
+    [[ "$estimated" =~ ^[0-9]+$ && "$estimated" -gt 0 ]] ||
+        fail "Unable to determine the disc size"
+    available=$(df -B1 --output=avail "$temporary" | tail -n 1 | tr -d ' ')
+    [[ "$available" =~ ^[0-9]+$ ]] || fail "Unable to determine free space"
+    (( available > estimated + 67108864 )) ||
+        fail "Not enough free space for this disc"
+
+    if [[ "$destination_kind" == removable || "$destination_kind" == format ]]; then
+        filesystem=$(findmnt -nro FSTYPE --target "$destination")
+        case "$filesystem" in
+            vfat|msdos|fat)
+                (( estimated < 4294967295 )) ||
+                    fail "FAT32 cannot store this disc; format the cart as ext4, exFAT, or NTFS"
+                ;;
+        esac
+    fi
+
+    cp -f -- "$OPTICAL_CART/icon.png" "$temporary/icon.png"
+    for cover in cover.png cover.jpg .kazeta-cover.png; do
+        [[ -f "$OPTICAL_CART/$cover" ]] &&
+            cp -f -- "$OPTICAL_CART/$cover" "$temporary/$cover"
+    done
+    copy_disc_bios "$runtime" "$temporary"
+    cp -f -- "$kzi" "$temporary/cart.kzi"
+
+    device_name=$(basename "$device")
+
+    if [[ "$exec_value" == device:* ]]; then
+        # PCSX2's direct-device launcher has no file to copy. Release it and
+        # create a conventional ISO/BIN image for the installed library.
+        /usr/bin/kazeta-optical-disc-helper remove || true
+        systemctl stop "kazeta-cdstream@$device_name.service" 2>/dev/null || true
+        if udevadm info --query=property --name="$device" 2>/dev/null |
+            grep -q '^ID_CDROM_MEDIA_DVD=1$'; then
+            disc_kind=dvd
+        else
+            disc_kind=cd
+        fi
+        if [[ "$disc_kind" == dvd ]]; then
+            image_tmp="$temporary/game/disc.iso.partial"
+            copy_file_with_progress "$device" "$image_tmp" "$estimated" \
+                "RIPPING DISC" ||
+                fail "The optical DVD read failed"
+            image_size=$(stat -c %s "$image_tmp")
+            (( image_size >= estimated )) || fail "The optical DVD read was incomplete"
+            mv -- "$image_tmp" "$temporary/game/disc.iso"
+            exec_path="game/disc.iso"
+        else
+            command -v cdrdao >/dev/null || fail "The raw-disc reader is missing"
+            image_tmp="$temporary/game/disc.bin.partial"
+            toc_tmp="$temporary/game/disc.toc.partial"
+            percent_command_with_progress "RIPPING DISC" cdrdao read-cd \
+                --device "$device" \
+                --read-raw \
+                --datafile "$image_tmp" \
+                "$toc_tmp" || fail "The optical CD read failed"
+            [[ -s "$image_tmp" ]] || fail "The optical CD read was incomplete"
+            mv -- "$image_tmp" "$temporary/game/disc.bin"
+            rm -f -- "$toc_tmp"
+            exec_path="game/disc.bin"
+        fi
+    else
+        source_exec=$(realpath -e -- "$OPTICAL_CART/$exec_value") ||
+            fail "The streamed optical image disappeared"
+        case "${source_exec,,}" in
+            *.cue)
+                [[ -r /run/kazeta/cdstream/disc.bin ]] ||
+                    fail "The raw CD stream disappeared"
+                copy_file_with_progress \
+                    /run/kazeta/cdstream/disc.bin \
+                    "$temporary/game/disc.bin.partial" \
+                    "$(stat -c %s /run/kazeta/cdstream/disc.bin)" \
+                    "RIPPING DISC"
+                mv -- "$temporary/game/disc.bin.partial" \
+                    "$temporary/game/disc.bin"
+                sed -E \
+                    's#^FILE "[^"]*" BINARY#FILE "disc.bin" BINARY#' \
+                    "$source_exec" > "$temporary/game/disc.cue"
+                exec_path="game/disc.cue"
+                ;;
+            *.gdi)
+                # A GDI descriptor references sibling track files. Optical
+                # data carriers are read-only and bounded by the disc size, so
+                # preserve the complete containing directory.
+                copy_tree_with_progress "$(dirname "$source_exec")" \
+                    "$temporary/game" "RIPPING DISC"
+                target_name=$(basename "$source_exec")
+                exec_path="game/$target_name"
+                ;;
+            *)
+                target_name=$(basename "$source_exec")
+                copy_file_with_progress "$source_exec" \
+                    "$temporary/game/$target_name.partial" \
+                    "$(stat -Lc %s "$source_exec")" "RIPPING DISC"
+                mv -- "$temporary/game/$target_name.partial" \
+                    "$temporary/game/$target_name"
+                exec_path="game/$target_name"
+                ;;
+        esac
+        /usr/bin/kazeta-optical-disc-helper remove || true
+        systemctl stop "kazeta-cdstream@$device_name.service" 2>/dev/null || true
+    fi
+
+    sed -i -E \
+        -e "s#^[[:space:]]*Id[[:space:]]*=.*#Id=$final_id#" \
+        -e "s#^[[:space:]]*Exec[[:space:]]*=.*#Exec=$exec_path#" \
+        "$temporary/cart.kzi"
+
+    find "$temporary" -type d -exec chmod 755 {} +
+    find "$temporary" -type f -exec chmod 644 {} +
+    sync "$temporary"
+
+    if [[ "$destination_kind" == internal || "$destination_kind" == internal-storage ]]; then
+        chown -R kazetaftp:kazetaftp "$temporary"
+        mv -- "$temporary" "$destination"
+    else
+        mv -- "$temporary/game" "$destination/game"
+        mv -- "$temporary/bios" "$destination/bios"
+        mv -- "$temporary/icon.png" "$destination/icon.png"
+        mv -- "$temporary/cart.kzi" "$destination/cart.kzi"
+        for cover in cover.png cover.jpg .kazeta-cover.png; do
+            [[ -f "$temporary/$cover" ]] &&
+                mv -- "$temporary/$cover" "$destination/$cover"
+        done
+        rmdir "$temporary"
+    fi
+    trap - EXIT
+    sync
+    mkdir -p "/run/media/$device_name"
+    /usr/bin/kazeta-optical-disc-helper \
+        auto "$device" "/run/media/$device_name" >/dev/null 2>&1 || true
+    printf 'Installed %s as %s\n' "$name" "$final_id"
+}
+
+export_internal_game() {
+    local destination_kind="$1"
+    local requested_target="$2"
+    local game_id="$3"
+    local source destination temporary final_id filesystem available required
+    local source_kzi temporary_kzi manifest
+
+    valid_id "$game_id" || fail "Invalid game ID"
+    source=$(library_game_path "$game_id") || fail "Internal game not found"
+    mapfile -d '' source_kzi_files < <(
+        find "$source" -maxdepth 1 -type f -iname '*.kzi' -print0
+    )
+    [[ ${#source_kzi_files[@]} -eq 1 ]] ||
+        fail "Internal game must contain exactly one KZI file"
+    source_kzi="${source_kzi_files[0]}"
+    [[ "$(field_from_kzi Id "$source_kzi")" == "$game_id" ]] ||
+        fail "Internal game KZI ID does not match its folder"
+
+    case "$destination_kind" in
+        burn)
+            burn_internal_game "$source" "$requested_target" "$game_id"
+            return 0
+            ;;
+        mounted)
+            requested_target=$(realpath -e -- "$requested_target") ||
+                fail "The selected removable drive disappeared"
+            destination=$(validate_removable_target "$requested_target")
+            ;;
+        format)
+            requested_target=$(realpath -e -- "$requested_target") ||
+                fail "The selected removable device disappeared"
+            destination=$(format_ext4_cart "$requested_target" "$game_id")
+            ;;
+        *) fail "Unknown export destination" ;;
+    esac
+
+    for conflict in cart.kzi game icon.png cover.png cover.jpg .kazeta-cover.png; do
+        [[ ! -e "$destination/$conflict" ]] ||
+            fail "The selected drive already contains Kazeta cart files"
+    done
+    if find "$destination" -maxdepth 1 -type f \
+        \( -iname '*.kzi' -o -iname '*.kzp' \) -print -quit | grep -q .; then
+        fail "The selected drive already contains a Kazeta cart; use ERASE + FORMAT EXT4"
+    fi
+
+    required=$(du -sb -- "$source" | cut -f1)
+    available=$(df -B1 --output=avail "$destination" | tail -n 1 | tr -d ' ')
+    [[ "$required" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] ||
+        fail "Unable to determine storage requirements"
+    (( available > required + 67108864 )) || fail "Not enough free space for this game"
+
+    filesystem=$(findmnt -nro FSTYPE --target "$destination")
+    if [[ "$filesystem" == vfat || "$filesystem" == msdos || "$filesystem" == fat ]]; then
+        if find "$source" -type f -size +4294967294c -print -quit | grep -q .; then
+            fail "FAT32 cannot store this game; use the ERASE + FORMAT EXT4 option"
+        fi
+    fi
+
+    final_id=${game_id#internal-}
+    final_id="portable-$final_id"
+    valid_id "$final_id" || fail "Unable to create a portable cart ID"
+    temporary="$destination/.kazeta-export-${game_id}-$$"
+    manifest="$temporary/.source-files.sha256"
+    trap 'rm -rf -- "${temporary:-}"' EXIT
+    mkdir -p "$temporary"
+    copy_tree_with_progress "$source" "$temporary" "COPYING GAME"
+
+    temporary_kzi="$temporary/$(basename "$source_kzi")"
+    sed -i -E "s#^[[:space:]]*Id[[:space:]]*=.*#Id=$final_id#" "$temporary_kzi"
+    [[ "$(field_from_kzi Id "$temporary_kzi")" == "$final_id" ]] ||
+        fail "Unable to write the portable cart ID"
+
+    (
+        cd "$source"
+        find . -type f ! -iname '*.kzi' -print0 |
+            LC_ALL=C sort -z |
+            xargs -0r sha256sum
+    ) > "$manifest"
+    (
+        cd "$temporary"
+        sha256sum -c ".source-files.sha256"
+    ) >/dev/null || fail "Export verification failed"
+    rm -f -- "$manifest"
+
+    find "$temporary" -type d -exec chmod 755 {} +
+    find "$temporary" -type f -exec chmod 644 {} +
+    sync "$temporary"
+    find "$temporary" -mindepth 1 -maxdepth 1 -exec mv -t "$destination" -- {} +
+    rmdir "$temporary"
+    trap - EXIT
+    sync "$destination"
+    printf 'Exported %s as %s\n' "$game_id" "$final_id"
+}
+
+install_game_to_library() {
+    local source_requested="$1" game_id="$2" storage_token="$3"
+    local source_dir library_root destination temporary kzi declared_id
+    local exec_path icon_path cover_path source_kzi system_folder
+
+    source_dir=$(realpath -e -- "$source_requested") ||
+        fail "Source folder does not exist"
+    valid_id "$game_id" || fail "Invalid game ID"
+    case "$source_dir/" in
+        /run/media/*|/media/*) ;;
+        *) fail "Source must be mounted removable or optical media" ;;
+    esac
+
+    mapfile -d '' source_kzi_files < <(
+        find "$source_dir" -maxdepth 1 -type f -iname '*.kzi' -print0
+    )
+    [[ ${#source_kzi_files[@]} -eq 1 ]] ||
+        fail "Game folder must contain exactly one KZI file"
+    source_kzi="${source_kzi_files[0]}"
+    system_folder=$(system_folder_for_kzi "$source_kzi")
+
+    library_root=$(library_path_for_token "$storage_token")
+    library_root="$library_root/$system_folder"
+    mkdir -p "$library_root"
+    game_id_exists_anywhere "$game_id" &&
+        fail "A game with this ID already exists in the PlayFusion library"
+    destination="$library_root/$game_id"
+    temporary="$library_root/.install-${game_id}-$$"
+    trap 'rm -rf -- "${temporary:-}"' EXIT
+    mkdir -p "$temporary"
+    if [[ "$source_dir" == "/run/media/playfusion-loose-rom" ||
+        "$source_dir" == /run/media/playfusion-loose-rom/* ]]; then
+        # Virtual loose-ROM carts contain an absolute symlink to the inserted
+        # media. Dereference that single safe content link so the installed
+        # game remains usable after the USB drive or data disc is removed.
+        copy_tree_with_progress "$source_dir" "$temporary" "INSTALLING GAME" true
+    else
+        copy_tree_with_progress "$source_dir" "$temporary" "INSTALLING GAME"
+    fi
+
+    mapfile -d '' kzi_files < <(
+        find "$temporary" -maxdepth 1 -type f -iname '*.kzi' -print0
+    )
+    [[ ${#kzi_files[@]} -eq 1 ]] ||
+        fail "Game folder must contain exactly one KZI file"
+    kzi="${kzi_files[0]}"
+    declared_id=$(field_from_kzi Id "$kzi")
+    [[ "$declared_id" == "$game_id" ]] ||
+        fail "KZI ID does not match selected game"
+    exec_path=$(field_from_kzi Exec "$kzi")
+    icon_path=$(field_from_kzi Icon "$kzi")
+    cover_path=$(field_from_kzi Cover "$kzi")
+    validate_relative_file "$temporary" "$exec_path"
+    validate_relative_file "$temporary" "$icon_path"
+    validate_optional_relative_file "$temporary" "$cover_path"
+
+    chown -R gamer:kazetaftp "$temporary"
+    find "$temporary" -type d -exec chmod 2775 {} +
+    find "$temporary" -type f -exec chmod 0664 {} +
+    if [[ -n "$exec_path" ]]; then
+        chmod 0775 "$temporary/$exec_path" 2>/dev/null || true
+    fi
+    sync "$temporary"
+    mv -- "$temporary" "$destination"
+    trap - EXIT
+    sync "$library_root"
+}
+
+delete_library_game() {
+    local requested_folder="$1" game_id="$2"
+    local folder parent allowed=0 root resolved_root trash
+    valid_id "$game_id" || fail "Invalid game ID"
+    folder=$(realpath -e -- "$requested_folder") || fail "Game folder not found"
+    [[ -d "$folder" && ! -L "$folder" && "$(basename "$folder")" == "$game_id" ]] ||
+        fail "Unsafe game folder"
+    parent=$(dirname "$folder")
+    mount_storage_volumes
+    for root in "$LIBRARY_DIR" "$STORAGE_DIR"/*/games; do
+        [[ -d "$root" ]] || continue
+        resolved_root=$(realpath -e -- "$root")
+        if [[ "$parent" == "$resolved_root" ||
+            "$(dirname "$parent")" == "$resolved_root" ]]; then
+            allowed=1
+            break
+        fi
+    done
+    [[ "$allowed" -eq 1 ]] ||
+        fail "Game is outside a managed PlayFusion library"
+    trash="$parent/.delete-${game_id}-$$"
+    mv -- "$folder" "$trash"
+    sync "$parent"
+    rm -rf -- "$trash"
+    sync "$parent"
+}
+
+organize_library_root() {
+    local root="$1" game_folder kzi system_folder destination
+    [[ -d "$root" ]] || return 0
+    while IFS= read -r -d '' game_folder; do
+        mapfile -d '' kzi_files < <(
+            find "$game_folder" -maxdepth 1 -type f -iname '*.kzi' -print0
+        )
+        [[ ${#kzi_files[@]} -eq 1 ]] || continue
+        kzi="${kzi_files[0]}"
+        system_folder=$(system_folder_for_kzi "$kzi")
+        destination="$root/$system_folder/$(basename "$game_folder")"
+        [[ ! -e "$destination" ]] ||
+            fail "Organization destination already exists: $destination"
+        mkdir -p "$root/$system_folder"
+        chown gamer:kazetaftp "$root/$system_folder"
+        chmod 2775 "$root/$system_folder"
+        mv -- "$game_folder" "$destination"
+        printf 'ORGANIZED\t%s\t%s\n' "$(field_from_kzi Id "$kzi")" "$system_folder"
+    done < <(
+        find "$root" -mindepth 1 -maxdepth 1 -type d ! -name '.*' -print0
+    )
+    sync "$root"
+}
+
+organize_libraries() {
+    local root
+    organize_library_root "$LIBRARY_DIR"
+    mount_storage_volumes
+    for root in "$STORAGE_DIR"/*/games; do
+        [[ -d "$root" ]] || continue
+        organize_library_root "$root"
+    done
+}
+
+[[ $EUID -eq 0 ]] || fail "This helper must run as root"
+mkdir -p "$LIBRARY_DIR"
+
+case "${1:-}" in
+    mount-storage)
+        [[ $# -eq 1 ]] || fail "Usage: $0 mount-storage"
+        mount_storage_volumes
+        ;;
+
+    list-storage)
+        [[ $# -eq 1 ]] || fail "Usage: $0 list-storage"
+        list_storage
+        ;;
+
+    list-library-targets)
+        [[ $# -eq 1 ]] || fail "Usage: $0 list-library-targets"
+        list_library_targets
+        ;;
+
+    organize-libraries)
+        [[ $# -eq 1 ]] || fail "Usage: $0 organize-libraries"
+        organize_libraries
+        ;;
+
+    format-storage)
+        [[ $# -eq 2 ]] || fail "Usage: $0 format-storage DEVICE"
+        format_internal_storage "$2"
+        ;;
+
+    validate-storage)
+        [[ $# -eq 2 ]] || fail "Usage: $0 validate-storage DEVICE"
+        validate_internal_data_disk "$2"
+        ;;
+
+    list-targets)
+        [[ $# -eq 1 ]] || fail "Usage: $0 list-targets"
+        mounted_removable_targets || true
+        removable_format_disks || true
+        blank_optical_targets || true
+        ;;
+
+    install-disc)
+        [[ $# -eq 4 ]] ||
+            fail "Usage: $0 install-disc internal - GAME_ID | install-disc removable MOUNTPOINT GAME_ID"
+        rip_optical_disc "$2" "$3" "$4"
+        ;;
+
+    export)
+        [[ $# -eq 4 ]] ||
+            fail "Usage: $0 export mounted MOUNTPOINT GAME_ID | export format DEVICE GAME_ID"
+        export_internal_game "$2" "$3" "$4"
+        ;;
+
+    install)
+        [[ $# -eq 3 ]] || fail "Usage: $0 install SOURCE_FOLDER GAME_ID"
+        install_game_to_library "$2" "$3" system
+        ;;
+
+    install-to)
+        [[ $# -eq 4 ]] ||
+            fail "Usage: $0 install-to SOURCE_FOLDER GAME_ID STORAGE_TOKEN"
+        install_game_to_library "$2" "$3" "$4"
+        ;;
+
+    delete)
+        [[ $# -eq 2 ]] || fail "Usage: $0 delete GAME_ID"
+        game_id="$2"
+        game_folder=$(library_game_path "$game_id") || fail "Game folder not found"
+        delete_library_game "$game_folder" "$game_id"
+        ;;
+
+    delete-path)
+        [[ $# -eq 3 ]] || fail "Usage: $0 delete-path GAME_FOLDER GAME_ID"
+        delete_library_game "$2" "$3"
+        ;;
+
+    *)
+        fail "Usage: $0 list-storage | format-storage DEVICE | list-library-targets | install-to SOURCE GAME_ID STORAGE_TOKEN | delete-path GAME_FOLDER GAME_ID | list-targets | install-disc DESTINATION TARGET GAME_ID | export DESTINATION TARGET GAME_ID"
+        ;;
+esac

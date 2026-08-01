@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch the Kazeta FTP runtime upload folder
+
+[Path]
+PathChanged=/var/kazeta/runtime-uploads
+Unit=kazeta-import-ftp-runtimes.service
+
+[Install]
+WantedBy=multi-user.target

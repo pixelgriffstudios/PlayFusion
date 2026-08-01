@@ -1,0 +1,36 @@
+#!/bin/sh
+#
+# Some SHANWAN-compatible pads occasionally expose only their Android media
+# keys during a cold boot because the primary HID report descriptor fails its
+# first parse. Re-authorizing only that USB device makes it enumerate normally.
+
+VENDOR_ID="2563"
+PRODUCT_ID="0526"
+JOYSTICK_LINK="/dev/input/by-id/usb-SHANWAN_Android_Gamepad-event-joystick"
+
+# Give udev a short opportunity to finish normal enumeration first.
+attempt=0
+while [ "$attempt" -lt 5 ]; do
+    if [ -e "$JOYSTICK_LINK" ]; then
+        exit 0
+    fi
+    attempt=$((attempt + 1))
+    sleep 1
+done
+
+for device in /sys/bus/usb/devices/*; do
+    [ -f "$device/idVendor" ] || continue
+    [ -f "$device/idProduct" ] || continue
+    [ -f "$device/authorized" ] || continue
+    [ "$(tr 'A-F' 'a-f' < "$device/idVendor")" = "$VENDOR_ID" ] || continue
+    [ "$(tr 'A-F' 'a-f' < "$device/idProduct")" = "$PRODUCT_ID" ] || continue
+
+    logger -t super-kazeta-controller \
+        "Recovering SHANWAN gamepad joystick interface at $device"
+    printf '0\n' > "$device/authorized"
+    sleep 2
+    printf '1\n' > "$device/authorized"
+    exit 0
+done
+
+exit 0

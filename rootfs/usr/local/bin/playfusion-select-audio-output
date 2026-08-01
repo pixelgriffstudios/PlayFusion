@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG="$HOME/.local/share/kazeta-plus/config.toml"
+LOG="/var/kazeta/state/audio-output.log"
+
+mkdir -p "$(dirname "$LOG")"
+
+saved_output=$(
+    sed -nE 's/^[[:space:]]*audio_output[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+        "$CONFIG" 2>/dev/null | head -n 1 || true
+)
+
+digital_ready=false
+for _attempt in $(seq 1 240); do
+    mapfile -t sinks < <(pactl list short sinks 2>/dev/null || true)
+    if printf '%s\n' "${sinks[@]}" |
+        grep -Eiq '(hdmi|displayport)'; then
+        digital_ready=true
+        break
+    fi
+    sleep 0.25
+done
+
+if [[ ${#sinks[@]} -eq 0 ]]; then
+    printf '%s no PipeWire sinks found\n' "$(date -Is)" >>"$LOG"
+    exit 0
+fi
+
+target=""
+if [[ -n "$saved_output" && "$saved_output" != "Auto" ]]; then
+    for row in "${sinks[@]}"; do
+        name=$(awk '{print $2}' <<<"$row")
+        if [[ "$name" == "$saved_output" ]]; then
+            target="$name"
+            break
+        fi
+    done
+fi
+
+# Auto mode prefers an active HDMI/DisplayPort output. If none is active yet,
+# select the first digital sink so boot timing cannot leave analog selected.
+if [[ -z "$target" ]]; then
+    target=$(
+        printf '%s\n' "${sinks[@]}" |
+            awk 'tolower($0) ~ /(hdmi|displayport)/ && $0 ~ /RUNNING/ {print $2; exit}'
+    )
+fi
+if [[ -z "$target" ]]; then
+    target=$(
+        printf '%s\n' "${sinks[@]}" |
+            awk 'tolower($0) ~ /(hdmi|displayport)/ {print $2; exit}'
+    )
+fi
+if [[ -z "$target" ]]; then
+    target=$(printf '%s\n' "${sinks[@]}" | awk 'NR == 1 {print $2}')
+fi
+
+if [[ -z "$target" ]]; then
+    printf '%s no usable audio sink found\n' "$(date -Is)" >>"$LOG"
+    exit 0
+fi
+
+pactl set-default-sink "$target"
+while read -r input _rest; do
+    [[ "$input" =~ ^[0-9]+$ ]] || continue
+    pactl move-sink-input "$input" "$target" 2>/dev/null || true
+done < <(pactl list short sink-inputs 2>/dev/null || true)
+
+printf '%s selected %s (saved=%s)\n' \
+    "$(date -Is)" "$target" "${saved_output:-Auto}" >>"$LOG"

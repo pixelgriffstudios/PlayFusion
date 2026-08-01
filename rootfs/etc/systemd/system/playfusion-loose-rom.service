@@ -1,0 +1,6 @@
+[Unit]
+Description=Create virtual PlayFusion carts for games, movies, and music
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/playfusion-loose-rom-helper settle

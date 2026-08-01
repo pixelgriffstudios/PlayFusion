@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TARGET=${1:-}
+INPUT_CONFIG=/etc/super-kazeta/mpv-movie-input.conf
+LOG_FILE=/var/kazeta/state/movie-player.log
+
+MEDIA=()
+if [[ -f "$TARGET" ]]; then
+    MEDIA=("$TARGET")
+elif [[ -d "$TARGET" ]]; then
+    mapfile -d '' MEDIA < <(
+        find "$TARGET" -type f \
+            \( -iname '*.mp4' -o -iname '*.mkv' -o -iname '*.avi' \
+               -o -iname '*.mov' -o -iname '*.m4v' -o -iname '*.webm' \
+               -o -iname '*.mpg' -o -iname '*.mpeg' -o -iname '*.ts' \
+               -o -iname '*.m2ts' \) \
+            -print0 | sort -z
+    )
+fi
+if [[ ${#MEDIA[@]} -eq 0 ]]; then
+    echo "No playable movie or TV episode found: $TARGET" >&2
+    exit 2
+fi
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+exec /usr/bin/mpv \
+    --no-config \
+    --fs \
+    --keep-open=no \
+    --input-gamepad=yes \
+    --input-conf="$INPUT_CONFIG" \
+    --osd-level=1 \
+    --audio-channels=auto-safe \
+    --vo=gpu \
+    --gpu-api=opengl \
+    --hwdec=vaapi-copy \
+    --video-sync=display-resample \
+    --interpolation=no \
+    --scale=bilinear \
+    --cscale=bilinear \
+    --dscale=bilinear \
+    --correct-downscaling=no \
+    --linear-downscaling=no \
+    --sigmoid-upscaling=no \
+    --deband=no \
+    --log-file="$LOG_FILE" \
+    -- "${MEDIA[@]}"

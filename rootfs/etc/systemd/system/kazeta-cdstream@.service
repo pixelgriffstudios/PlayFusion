@@ -1,0 +1,13 @@
+[Unit]
+Description=PlayFusion seekable console-disc bridge for %I
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /run/kazeta/cdstream
+ExecStart=/usr/bin/kazeta-cdstream /dev/%I /run/kazeta/cdstream -f -s -o ro,allow_other
+ExecStop=-/usr/bin/fusermount3 -u /run/kazeta/cdstream
+Restart=no
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target

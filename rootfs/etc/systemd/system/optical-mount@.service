@@ -1,0 +1,7 @@
+[Unit]
+Description=Mount Optical Media (%i)
+
+[Service]
+Type=oneshot
+TimeoutStartSec=30min
+ExecStart=/usr/bin/kazeta-optical-disc-helper auto /dev/%I /run/media/%I

@@ -1,0 +1,23 @@
+[Unit]
+Description=Kazeta Internal Games and Runtimes FTP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /var/kazeta/internal-games /var/kazeta/runtime-uploads /var/kazeta/firmware/ps1 /var/kazeta/firmware/ps2 /var/kazeta/firmware/dreamcast /var/kazeta/firmware/segacd /var/kazeta/firmware/saturn /var/kazeta/firmware/pcengine /var/kazeta/firmware/retroarch /var/kazeta/firmware/xbox /var/kazeta/firmware/wiiu /var/kazeta/firmware/vita /var/kazeta/ftp/internal-games /var/kazeta/ftp/runtimes /var/kazeta/ftp/firmware
+ExecStartPre=/usr/bin/chown kazetaftp:kazetaftp /var/kazeta/internal-games /var/kazeta/runtime-uploads /var/kazeta/firmware /var/kazeta/firmware/ps1 /var/kazeta/firmware/ps2 /var/kazeta/firmware/dreamcast /var/kazeta/firmware/segacd /var/kazeta/firmware/saturn /var/kazeta/firmware/pcengine /var/kazeta/firmware/retroarch /var/kazeta/firmware/xbox /var/kazeta/firmware/wiiu /var/kazeta/firmware/vita
+ExecStart=/usr/bin/vsftpd /etc/vsftpd-kazeta-internal.conf
+Restart=on-failure
+RestartSec=3
+PrivateTmp=yes
+ProtectSystem=strict
+BindPaths=/var/kazeta/internal-games:/var/kazeta/ftp/internal-games
+BindPaths=/var/kazeta/runtime-uploads:/var/kazeta/ftp/runtimes
+BindPaths=/var/kazeta/firmware:/var/kazeta/ftp/firmware
+ReadWritePaths=/var/kazeta/internal-games
+ReadWritePaths=/var/kazeta/runtime-uploads
+ReadWritePaths=/var/kazeta/firmware
+
+[Install]
+WantedBy=multi-user.target

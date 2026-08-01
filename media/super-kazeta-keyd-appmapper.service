@@ -1,0 +1,14 @@
+[Unit]
+Description=Super Kazeta application-specific keyboard mappings
+After=graphical-session-pre.target
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/keyd-application-mapper
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

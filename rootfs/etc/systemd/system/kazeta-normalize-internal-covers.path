@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for Kazeta internal-game library changes
+
+[Path]
+PathChanged=/var/kazeta/internal-games
+Unit=kazeta-normalize-internal-covers.service
+
+[Install]
+WantedBy=multi-user.target

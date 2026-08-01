@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MUSIC_ROOT="${SUPER_KAZETA_MUSIC_ROOT:-/var/kazeta/music}"
+INPUT_CONFIG="/etc/super-kazeta/mpv-jukebox-input.conf"
+LOG_FILE="/var/kazeta/state/jukebox.log"
+TARGET="${1:-$MUSIC_ROOT}"
+PLAY_MODE="${2:---shuffle}"
+PRESET_SECONDS="${3:-25}"
+PROJECTM_BIN="/usr/bin/projectM-pulseaudio"
+
+case "$PRESET_SECONDS" in
+    5|10|15|20|25) ;;
+    *) PRESET_SECONDS=25 ;;
+esac
+
+if [[ -f "$TARGET" ]]; then
+    TRACKS=("$TARGET")
+else
+    mapfile -d '' TRACKS < <(
+        find "$TARGET" -type f \
+            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' \
+               -o -iname '*.opus' -o -iname '*.m4a' -o -iname '*.wav' \) \
+            -print0 | sort -z
+    )
+fi
+
+if [[ ${#TRACKS[@]} -eq 0 ]]; then
+    echo "No supported music files found in $TARGET" >&2
+    exit 2
+fi
+
+ORDER_OPTIONS=()
+if [[ "$PLAY_MODE" == "--shuffle" && ${#TRACKS[@]} -gt 1 ]]; then
+    ORDER_OPTIONS+=(--shuffle)
+fi
+
+MPV_PID=""
+PROJECTM_PID=""
+
+cleanup() {
+    if [[ -n "$PROJECTM_PID" ]]; then
+        kill -TERM "$PROJECTM_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MPV_PID" ]]; then
+        kill -TERM "$MPV_PID" 2>/dev/null || true
+    fi
+    sleep 0.2
+    if [[ -n "$PROJECTM_PID" ]]; then
+        kill -KILL "$PROJECTM_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MPV_PID" ]]; then
+        kill -KILL "$MPV_PID" 2>/dev/null || true
+    fi
+}
+trap cleanup EXIT INT TERM
+
+/usr/bin/mpv \
+    --no-config \
+    --no-video \
+    --force-window=no \
+    --input-gamepad=yes \
+    --input-conf="$INPUT_CONFIG" \
+    "${ORDER_OPTIONS[@]}" \
+    --loop-playlist=inf \
+    --osd-level=1 \
+    --log-file="$LOG_FILE" \
+    "${TRACKS[@]}" &
+MPV_PID=$!
+
+sleep 0.8
+if [[ -x "$PROJECTM_BIN" ]]; then
+    sed -i -E \
+        "s/^Preset Duration[[:space:]]*=.*/Preset Duration = $PRESET_SECONDS/" \
+        "$HOME/.projectM/config.inp"
+    "$PROJECTM_BIN" >>"$LOG_FILE" 2>&1 &
+    PROJECTM_PID=$!
+else
+    echo "projectM is not installed" >>"$LOG_FILE"
+    wait "$MPV_PID"
+    exit $?
+fi
+
+# Returning from either the music player or projectM returns to Super Kazeta.
+wait -n "$MPV_PID" "$PROJECTM_PID" || true

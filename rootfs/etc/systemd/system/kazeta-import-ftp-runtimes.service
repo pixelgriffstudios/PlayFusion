@@ -1,0 +1,6 @@
+[Unit]
+Description=Import Kazeta runtimes uploaded through FTP
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kazeta-import-ftp-runtimes

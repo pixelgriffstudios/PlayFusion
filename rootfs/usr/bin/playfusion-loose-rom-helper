@@ -1,0 +1,867 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+VISIBLE_CART=/run/media/playfusion-loose-rom
+CACHE_ROOT=/var/kazeta/loose-rom-cache
+STATE_DIR=/run/kazeta/loose-rom
+RUNTIME_ROOT=/usr/share/kazeta/runtimes
+ICON_ROOT=/usr/share/kazeta/optical-icons
+UNKNOWN_ICON="$ICON_ROOT/unknown.png"
+COVER_ROOT=https://raw.githubusercontent.com/libretro-thumbnails
+
+log() {
+    logger -t playfusion-loose-rom "$*"
+    printf '%s\n' "$*"
+}
+
+normalize_image_to_png() {
+    local source=$1 destination=$2 temporary signature
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    temporary="${destination}.part.$$.png"
+    rm -f "$temporary"
+    ffmpeg -nostdin -loglevel error -y -i "$source" -frames:v 1 \
+        "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    signature=$(head -c 8 "$temporary" | od -An -tx1 -v | tr -d '[:space:]')
+    [ "$signature" = 89504e470d0a1a0a ] || {
+        rm -f "$temporary"
+        return 1
+    }
+    mv -f "$temporary" "$destination"
+    chmod 644 "$destination"
+}
+
+remove_virtual_cart() {
+    if mountpoint -q "$VISIBLE_CART"; then
+        umount "$VISIBLE_CART"
+    fi
+    rmdir "$VISIBLE_CART" 2>/dev/null || true
+    rm -f \
+        "$STATE_DIR/source" \
+        "$STATE_DIR/cart-id" \
+        "$STATE_DIR/manifest" \
+        "$STATE_DIR/count" \
+        "$STATE_DIR/ready"
+}
+
+runtime_exists() {
+    local runtime=$1 candidate
+    # Native Linux payloads (movies and music) launch host-side players and
+    # therefore do not require a packaged Kazeta runtime.
+    [ "$runtime" != linux ] || return 0
+    for candidate in \
+        "$RUNTIME_ROOT/$runtime" \
+        "$RUNTIME_ROOT/$runtime.kzr" \
+        "$RUNTIME_ROOT/$runtime-"*.kzr; do
+        [ -f "$candidate" ] && return 0
+    done
+    return 1
+}
+
+cover_repository() {
+    case "$1" in
+        nes) printf 'Nintendo_-_Nintendo_Entertainment_System' ;;
+        snes) printf 'Nintendo_-_Super_Nintendo_Entertainment_System' ;;
+        gameboy) printf 'Nintendo_-_Game_Boy' ;;
+        gameboycolor) printf 'Nintendo_-_Game_Boy_Color' ;;
+        gameboyadvance) printf 'Nintendo_-_Game_Boy_Advance' ;;
+        nintendods) printf 'Nintendo_-_Nintendo_DS' ;;
+        nintendo3ds) printf 'Nintendo_-_Nintendo_3DS' ;;
+        nintendo64) printf 'Nintendo_-_Nintendo_64' ;;
+        mastersystem) printf 'Sega_-_Master_System_-_Mark_III' ;;
+        gamegear) printf 'Sega_-_Game_Gear' ;;
+        megadrive) printf 'Sega_-_Mega_Drive_-_Genesis' ;;
+        sega32x) printf 'Sega_-_32X' ;;
+        pcengine) printf 'NEC_-_PC_Engine_-_TurboGrafx_16' ;;
+        atari2600) printf 'Atari_-_2600' ;;
+        atari7800) printf 'Atari_-_7800' ;;
+        atarilynx) printf 'Atari_-_Lynx' ;;
+        jaguar) printf 'Atari_-_Jaguar' ;;
+        psp) printf 'Sony_-_PlayStation_Portable' ;;
+        ps1) printf 'Sony_-_PlayStation' ;;
+        ps2) printf 'Sony_-_PlayStation_2' ;;
+        wii) printf 'Nintendo_-_Wii' ;;
+        gamecube) printf 'Nintendo_-_GameCube' ;;
+        wiiu) printf 'Nintendo_-_Wii_U' ;;
+        dreamcast) printf 'Sega_-_Dreamcast' ;;
+        saturn) printf 'Sega_-_Saturn' ;;
+        segacd) printf 'Sega_-_Mega-CD_-_Sega_CD' ;;
+        *) return 1 ;;
+    esac
+}
+
+cache_catalog_cover() {
+    local cart_dir=$1 platform=$2 title=$3
+    local repository candidate encoded tmp signature
+
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    repository=$(cover_repository "$platform") || return 1
+
+    tmp="$cart_dir/.cover.png.$$"
+    rm -f "$tmp"
+    while IFS= read -r candidate; do
+        [ -n "$candidate" ] || continue
+        encoded=$(python3 -c \
+            'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+            "$candidate") || continue
+        if curl -fsSL --connect-timeout 2 --max-time 6 \
+            "$COVER_ROOT/$repository/master/Named_Boxarts/$encoded.png" -o "$tmp"; then
+            break
+        fi
+        rm -f "$tmp"
+    done < <(
+        python3 - "$title" <<'PY'
+import re
+import sys
+
+title = sys.argv[1].strip()
+candidates = []
+
+def add(value):
+    value = re.sub(r"\s+", " ", value).strip()
+    if value and value not in candidates:
+        candidates.append(value)
+
+add(title)
+# No-Intro language tags such as (En,Ja) are often omitted by the
+# libretro artwork repository even when region and revision tags remain.
+without_languages = re.sub(
+    r"\s*\((?:[A-Z][a-z](?:,[A-Z][a-z])*)\)", "", title
+)
+add(without_languages)
+
+# Compilation/dump annotations are frequently absent too. Try progressively
+# shorter right-hand parenthetical suffixes while preserving the best match
+# first, including region/revision names such as (World) (Rev B).
+for starting_value in (title, without_languages):
+    value = starting_value
+    while re.search(r"\s+\([^()]*\)$", value):
+        value = re.sub(r"\s+\([^()]*\)$", "", value).strip()
+        add(value)
+
+print("\n".join(candidates))
+PY
+    )
+    [ -s "$tmp" ] || return 1
+    signature=$(head -c 8 "$tmp" | od -An -tx1 -v | tr -d '[:space:]')
+    if [ "$signature" != 89504e470d0a1a0a ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$cart_dir/cover.png"
+    cp -f "$cart_dir/cover.png" "$cart_dir/icon.png"
+    chmod 644 "$cart_dir/cover.png" "$cart_dir/icon.png"
+}
+
+cache_media_library_cover() {
+    local cart_dir=$1 kind=$2 source=$3
+    local catalog_kind cover temporary signature
+
+    [ -x /usr/bin/playfusion-media-library ] || return 1
+    case "$kind" in
+        movie) catalog_kind=movies ;;
+        music) catalog_kind=music ;;
+        *) return 1 ;;
+    esac
+
+    # Resolve this inserted item directly. A full-library background refresh
+    # may contain hundreds of tracks and must not delay the Play gallery.
+    cover=$(
+        /usr/bin/playfusion-media-library cover "$catalog_kind" "$source" \
+            2>/dev/null || true
+    )
+    [ -n "$cover" ] && [ -s "$cover" ] || return 1
+    command -v ffmpeg >/dev/null 2>&1 || return 1
+    temporary="$cart_dir/.cover.$$.png"
+    rm -f "$temporary"
+    ffmpeg -nostdin -loglevel error -y -i "$cover" -frames:v 1 \
+        "$temporary" || {
+        rm -f "$temporary"
+        return 1
+    }
+    signature=$(head -c 8 "$temporary" | od -An -tx1 -v | tr -d '[:space:]')
+    [ "$signature" = 89504e470d0a1a0a ] || {
+        rm -f "$temporary"
+        return 1
+    }
+    mv -f "$temporary" "$cart_dir/cover.png"
+    cp -f "$cart_dir/cover.png" "$cart_dir/icon.png"
+    rm -f "$cart_dir/cover.jpg"
+    chmod 644 "$cart_dir/cover.png" "$cart_dir/icon.png"
+    return 0
+}
+
+read_hex() {
+    local file=$1 offset=$2 count=$3
+    dd if="$file" bs=1 skip="$offset" count="$count" status=none 2>/dev/null |
+        od -An -tx1 -v | tr -d '[:space:]'
+}
+
+required_firmware_present() {
+    local platform=$1
+    case "$platform" in
+        ps1)
+            [ -f /var/kazeta/firmware/ps1/scph5501.bin ] ||
+                find /var/kazeta/internal-games -path '*/bios/scph5501.bin' \
+                    -type f -print -quit 2>/dev/null | grep -q .
+            ;;
+        ps2)
+            find /var/kazeta/firmware/ps2 -maxdepth 1 -type f \
+                \( -iname '*.bin' -o -iname '*.rom0' \) -print -quit \
+                2>/dev/null | grep -q .
+            ;;
+        segacd)
+            find /var/kazeta/firmware/segacd -maxdepth 1 -type f \
+                \( -iname 'bios_CD_U.bin' -o -iname 'bios_CD_E.bin' \
+                   -o -iname 'bios_CD_J.bin' \) -print -quit \
+                2>/dev/null | grep -q .
+            ;;
+        saturn)
+            find /var/kazeta/firmware/saturn -maxdepth 1 -type f \
+                \( -iname 'sega_101.bin' -o -iname 'mpr-17933.bin' \) \
+                -print -quit 2>/dev/null | grep -q .
+            ;;
+        pcengine)
+            find /var/kazeta/firmware/pcengine -maxdepth 1 -type f \
+                -iname 'syscard3.pce' -print -quit 2>/dev/null | grep -q .
+            ;;
+        *) return 0 ;;
+    esac
+}
+
+probe_iso() {
+    local file=$1 magic24 magic28 magic_wbfs mount_dir system_cnf result=""
+
+    magic24=$(read_hex "$file" 24 4)
+    magic28=$(read_hex "$file" 28 4)
+    magic_wbfs=$(read_hex "$file" 0 4)
+    if [ "$magic24" = 5d1c9ea3 ]; then
+        printf 'dolphin\tdolphin-1.0\twii\n'
+        return 0
+    fi
+    if [ "$magic28" = c2339f3d ]; then
+        printf 'dolphin\tdolphin-1.0\tgamecube\n'
+        return 0
+    fi
+    if [ "$magic_wbfs" = 57424653 ]; then
+        printf 'dolphin\tdolphin-1.0\twii\n'
+        return 0
+    fi
+    mount_dir=$(mktemp -d)
+    if mount -o loop,ro,nosuid,nodev,noexec "$file" "$mount_dir" 2>/dev/null; then
+        if [ -d "$mount_dir/PSP_GAME" ]; then
+            result=$'psp\tpsp-1.0\tpsp'
+        else
+            system_cnf=$(find "$mount_dir" -maxdepth 2 -type f \
+                -iname 'SYSTEM.CNF*' -print -quit)
+            if [ -n "$system_cnf" ] &&
+                tr -d '\r' < "$system_cnf" |
+                    grep -Eiq '^[[:space:]]*BOOT2[[:space:]]*='; then
+                result=$'ps2\tplaystation2-1.0\tps2'
+            fi
+        fi
+        umount "$mount_dir"
+    fi
+    rmdir "$mount_dir"
+    [ -n "$result" ] || return 1
+    printf '%s\n' "$result"
+}
+
+probe_cue() {
+    local cue=$1 parent file_name data_file track_type payload signature
+    local system_id volume_id identification
+
+    parent=$(dirname "$cue")
+    file_name=$(sed -n -E \
+        's/^[[:space:]]*FILE[[:space:]]+"([^"]+)"[[:space:]]+BINARY.*/\1/Ip' \
+        "$cue" | head -n 1)
+    [ -n "$file_name" ] || return 1
+    data_file=$(realpath -e -- "$parent/$file_name" 2>/dev/null || true)
+    [ -f "$data_file" ] || return 1
+    case "$data_file" in "$parent"/*) ;; *) return 1 ;; esac
+    track_type=$(sed -n -E \
+        's/^[[:space:]]*TRACK[[:space:]]+[0-9]+[[:space:]]+(MODE[12]\/2352).*/\1/Ip' \
+        "$cue" | head -n 1)
+    case "$track_type" in MODE2/2352) payload=24 ;; *) payload=16 ;; esac
+    signature=$(
+        dd if="$data_file" bs=1 skip="$payload" count=32 status=none 2>/dev/null |
+            tr -d '\000\r\n'
+    )
+    case "$signature" in
+        "SEGA SEGASATURN"*) printf 'saturn\tsaturn-1.0\tsaturn\n'; return 0 ;;
+        SEGADISCSYSTEM*) printf 'segacd\tsegacd-1.0\tsegacd\n'; return 0 ;;
+        "SEGA SEGAKATANA"*) printf 'dreamcast\tdreamcast-1.0\tdreamcast\n'; return 0 ;;
+    esac
+    if [ -x /usr/bin/kazeta-ps1-identify ]; then
+        identification=$(/usr/bin/kazeta-ps1-identify "$data_file" 2>/dev/null || true)
+        if [ -n "$identification" ]; then
+            printf 'ps1\tplaystation-1.01\tps1\n'
+            return 0
+        fi
+    fi
+    system_id=$(
+        dd if="$data_file" bs=1 skip="$((16 * 2352 + payload + 8))" \
+            count=32 status=none 2>/dev/null | tr -d '\000\r\n'
+    )
+    volume_id=$(
+        dd if="$data_file" bs=1 skip="$((16 * 2352 + payload + 40))" \
+            count=32 status=none 2>/dev/null | tr -d '\000\r\n'
+    )
+    if printf '%s %s\n' "$system_id" "$volume_id" |
+        grep -Eiq 'PC[ _-]?ENGINE|TURBOGRAFX'; then
+        printf 'pcengine\tpcengine-1.0\tpcengine\n'
+        return 0
+    fi
+    return 1
+}
+
+probe_bin() {
+    local file=$1 magic signature header identification
+
+    magic=$(read_hex "$file" 0 4)
+    case "$magic" in
+        4e45531a) printf 'nes\tnes-1.0\tnes\n'; return 0 ;;
+        80371240|40123780|37804012)
+            printf 'nintendo64\tnintendo64-1.0\tnintendo64\n'
+            return 0
+            ;;
+        4c594e58) printf 'atarilynx\tatarilynx-1.0\tatarilynx\n'; return 0 ;;
+    esac
+    if [ "$(read_hex "$file" 24 4)" = 5d1c9ea3 ]; then
+        printf 'dolphin\tdolphin-1.0\twii\n'
+        return 0
+    fi
+    if [ "$(read_hex "$file" 28 4)" = c2339f3d ]; then
+        printf 'dolphin\tdolphin-1.0\tgamecube\n'
+        return 0
+    fi
+
+    for payload in 0 16 24; do
+        signature=$(
+            dd if="$file" bs=1 skip="$payload" count=32 status=none 2>/dev/null |
+                tr -d '\000\r\n'
+        )
+        case "$signature" in
+            "SEGA SEGASATURN"*) printf 'saturn\tsaturn-1.0\tsaturn\n'; return 0 ;;
+            SEGADISCSYSTEM*) printf 'segacd\tsegacd-1.0\tsegacd\n'; return 0 ;;
+            "SEGA SEGAKATANA"*) printf 'dreamcast\tdreamcast-1.0\tdreamcast\n'; return 0 ;;
+        esac
+    done
+
+    if [ -x /usr/bin/kazeta-ps1-identify ]; then
+        identification=$(/usr/bin/kazeta-ps1-identify "$file" 2>/dev/null || true)
+        if [ -n "$identification" ]; then
+            printf 'ps1\tplaystation-1.01\tps1\n'
+            return 0
+        fi
+    fi
+
+    header=$(
+        dd if="$file" bs=1 skip=256 count=16 status=none 2>/dev/null |
+            tr -d '\000\r\n'
+    )
+    case "$header" in
+        "SEGA 32X"*) printf 'sega32x\tsega32x-1.0\tsega32x\n'; return 0 ;;
+        SEGA*) printf 'megadrive\tmegadrive-1.1\tmegadrive\n'; return 0 ;;
+    esac
+    signature=$(
+        dd if="$file" bs=1 skip=1 count=8 status=none 2>/dev/null |
+            tr -d '\000\r\n'
+    )
+    if [ "$signature" = ATARI7800 ]; then
+        printf 'atari7800\tatari7800-1.0\tatari7800\n'
+        return 0
+    fi
+    return 1
+}
+
+probe_by_extension() {
+    local file=$1 archive_entry=${2:-}
+    local name extension magic
+
+    name=${archive_entry:-$(basename "$file")}
+    extension=${name##*.}
+    extension=${extension,,}
+    case "$extension" in
+        nes)
+            if [ -n "$archive_entry" ]; then
+                printf 'nes\tnes-1.0\tnes\n'
+            else
+                [ "$(read_hex "$file" 0 4)" = 4e45531a ] || return 1
+                printf 'nes\tnes-1.0\tnes\n'
+            fi
+            ;;
+        sfc|smc) printf 'snes\tsnes-1.0\tsnes\n' ;;
+        gb) printf 'gameboy\tgameboy-1.0\tgameboy\n' ;;
+        gbc) printf 'gameboycolor\tgameboycolor-1.0\tgameboycolor\n' ;;
+        gba) printf 'gameboyadvance\tgameboyadvance-1.0\tgameboyadvance\n' ;;
+        nds) printf 'nintendods\tnintendods-1.0\tnintendods\n' ;;
+        3ds|cci|cxi)
+            if [ -z "$archive_entry" ]; then
+                magic=$(
+                    dd if="$file" bs=1 skip=256 count=4 status=none 2>/dev/null |
+                        tr -d '\000\r\n'
+                )
+                [[ "$magic" == NCSD || "$magic" == NCCH ]] || return 1
+            fi
+            printf 'nintendo3ds\tnintendo3ds-1.0\tnintendo3ds\n'
+            ;;
+        z64)
+            [ -n "$archive_entry" ] ||
+                [ "$(read_hex "$file" 0 4)" = 80371240 ] || return 1
+            printf 'nintendo64\tnintendo64-1.0\tnintendo64\n'
+            ;;
+        n64)
+            [ -n "$archive_entry" ] ||
+                [ "$(read_hex "$file" 0 4)" = 40123780 ] || return 1
+            printf 'nintendo64\tnintendo64-1.0\tnintendo64\n'
+            ;;
+        v64)
+            [ -n "$archive_entry" ] ||
+                [ "$(read_hex "$file" 0 4)" = 37804012 ] || return 1
+            printf 'nintendo64\tnintendo64-1.0\tnintendo64\n'
+            ;;
+        sms) printf 'mastersystem\tmastersystem-1.0\tmastersystem\n' ;;
+        gg) printf 'gamegear\tgamegear-1.0\tgamegear\n' ;;
+        md|gen) printf 'megadrive\tmegadrive-1.1\tmegadrive\n' ;;
+        32x) printf 'sega32x\tsega32x-1.0\tsega32x\n' ;;
+        pce) printf 'pcengine\tpcengine-1.0\tpcengine\n' ;;
+        a26) printf 'atari2600\tatari2600-1.0\tatari2600\n' ;;
+        a78) printf 'atari7800\tatari7800-1.0\tatari7800\n' ;;
+        lnx) printf 'atarilynx\tatarilynx-1.0\tatarilynx\n' ;;
+        jag|j64) printf 'jaguar\tjaguar-1.0\tjaguar\n' ;;
+        d64|t64|prg) printf 'commodore64\tcommodore64-1.0\tcommodore64\n' ;;
+        adf|adz) printf 'amiga\tamiga-1.0\tamiga\n' ;;
+        cdi|gdi) printf 'dreamcast\tdreamcast-1.0\tdreamcast\n' ;;
+        wbfs) printf 'dolphin\tdolphin-1.0\twii\n' ;;
+        gcm|rvz) printf 'dolphin\tdolphin-1.0\tgamecube\n' ;;
+        wux|wud) printf 'wiiu\tcemu-1.0\twiiu\n' ;;
+        cso)
+            [ -n "$archive_entry" ] ||
+                [ "$(read_hex "$file" 0 4)" = 4349534f ] || return 1
+            printf 'psp\tpsp-1.0\tpsp\n'
+            ;;
+        bin) [ -z "$archive_entry" ] && probe_bin "$file" ;;
+        iso) [ -z "$archive_entry" ] && probe_iso "$file" ;;
+        cue) [ -z "$archive_entry" ] && probe_cue "$file" ;;
+        mp4|mkv|avi|mov|m4v|webm|mpg|mpeg|ts|m2ts)
+            [ -z "$archive_entry" ] || return 1
+            printf 'movie\tlinux\tmovie\n'
+            ;;
+        mp3|wav|flac|ogg|opus|m4a|aac|wma)
+            [ -z "$archive_entry" ] || return 1
+            printf 'music\tlinux\tmusic\n'
+            ;;
+        zip)
+            [ -z "$archive_entry" ] || return 1
+            command -v unzip >/dev/null || return 1
+            mapfile -t archive_files < <(
+                unzip -Z1 "$file" 2>/dev/null |
+                    sed '/\/$/d' |
+                    grep -v -E '(^|/)(__MACOSX|\.DS_Store)' || true
+            )
+            [ "${#archive_files[@]}" -eq 1 ] || return 1
+            probe_by_extension "$file" "${archive_files[0]}"
+            ;;
+        *) return 1 ;;
+    esac
+}
+
+candidate_roots() {
+    local root
+    for root in /run/media/* /run/media/*/* /media/*; do
+        [ -d "$root" ] || continue
+        case "$root" in
+            "$VISIBLE_CART"|/run/media/kazeta-optical|/run/media/kazeta-optical/*)
+                continue
+                ;;
+        esac
+        mountpoint -q "$root" || continue
+        printf '%s\0' "$root"
+    done
+}
+
+find_supported_roms() {
+    local root file result platform runtime kind relative top remainder show_name show_dir
+    local count=0
+    declare -A emitted_shows=()
+
+    while IFS= read -r -d '' root; do
+        while IFS= read -r -d '' file; do
+            result=$(probe_by_extension "$file" 2>/dev/null || true)
+            [ -n "$result" ] || continue
+            IFS=$'\t' read -r platform runtime kind <<< "$result"
+
+            # Media is opt-in so random videos/audio files beside ROMs do not
+            # clutter the cartridge browser. Folder matching is case-insensitive.
+            if [ "$kind" = movie ] || [ "$kind" = music ]; then
+                relative=${file#"$root"/}
+                top=${relative%%/*}
+                [ "$top" != "$relative" ] || continue
+                case "${top,,}:$kind" in
+                    movies:movie)
+                        ;;
+                    music:music)
+                        ;;
+                    shows:movie|"tv shows":movie)
+                        remainder=${relative#*/}
+                        show_name=${remainder%%/*}
+                        [ "$show_name" != "$remainder" ] || continue
+                        show_dir="$root/$top/$show_name"
+                        [ -d "$show_dir" ] || continue
+                        [ -z "${emitted_shows["$show_dir"]+set}" ] || continue
+                        emitted_shows["$show_dir"]=1
+                        count=$((count + 1))
+                        printf '%s\tshow\tlinux\tshow\n' "$show_dir"
+                        continue
+                        ;;
+                    *)
+                        continue
+                        ;;
+                esac
+            fi
+            count=$((count + 1))
+            printf '%s\t%s\n' "$file" "$result"
+        done < <(
+            find "$root" -maxdepth 4 \
+                \( -type d \( \
+                    -iname games -o -iname metadata -o -iname runtimes -o \
+                    -iname runtime-uploads -o -iname firmware -o -iname bios -o \
+                    -iname lost+found -o -iname '$RECYCLE.BIN' -o \
+                    -iname 'System Volume Information' \
+                \) -prune \) -o \
+                \( -type f -readable -size +0c -size -128G \
+                    ! -path '*/.*' -print0 \) 2>/dev/null
+        )
+    done < <(candidate_roots)
+
+    [ "$count" -gt 0 ]
+}
+
+create_cart_files() {
+    local source=$1 platform=$2 runtime=$3 kind=$4
+    local destination_root=${5:-} set_default=${6:-false}
+    local filename filename_lower stem slug digest cart_id cart_dir icon
+    local source_parent cover extension content_extension safe_filename local_art candidate
+    local gamescope_options
+
+    runtime_exists "$runtime" || {
+        log "$(basename "$source") was identified as $platform, but $runtime.kzr is missing."
+        return 1
+    }
+    required_firmware_present "$platform" || {
+        log "$(basename "$source") was identified as $platform, but its required BIOS is missing."
+        return 1
+    }
+
+    filename=$(basename "$source")
+    filename_lower=${filename,,}
+    stem=${filename%.*}
+    slug=$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//' | cut -c1-36)
+    [ -n "$slug" ] || slug=game
+    digest=$(printf '%s' "$filename_lower" | sha256sum | cut -c1-10)
+    if [ "$kind" = movie ] || [ "$kind" = music ] || [ "$kind" = show ]; then
+        cart_id="media-$kind-$slug-$digest"
+    else
+        cart_id="loose-$platform-$slug-$digest"
+    fi
+    if [ -n "$destination_root" ]; then
+        cart_dir="$destination_root/$cart_id"
+    else
+        cart_dir="$CACHE_ROOT/$cart_id/cart"
+    fi
+    source_parent=$(dirname "$source")
+    mkdir -p "$cart_dir" "$STATE_DIR"
+    rm -rf "$cart_dir/game"
+    mkdir -p "$cart_dir/game"
+    if [ "$kind" = show ]; then
+        safe_filename=show
+        ln -s "$source" "$cart_dir/game/$safe_filename"
+    else
+        content_extension=${filename##*.}
+        content_extension=$(printf '%s' "${content_extension,,}" |
+            sed -E 's/[^a-z0-9]+//g')
+        [ -n "$content_extension" ] || content_extension=rom
+        safe_filename="content.$content_extension"
+        ln -s "$source" "$cart_dir/game/$safe_filename"
+    fi
+    icon="$UNKNOWN_ICON"
+    [ -f "$icon" ] || icon="$ICON_ROOT/ps1.png"
+    normalize_image_to_png "$icon" "$cart_dir/icon.png" ||
+        cp -f "$icon" "$cart_dir/icon.png"
+    cover=""
+    for extension in png jpg jpeg webp avif; do
+        if [ "$kind" = show ]; then
+            local_art=""
+            for candidate in cover poster folder; do
+                [ -f "$source/$candidate.$extension" ] || continue
+                local_art="$source/$candidate.$extension"
+                break
+            done
+        else
+            local_art="$source_parent/$stem.$extension"
+        fi
+        if [ -n "${local_art:-}" ] && [ -f "$local_art" ]; then
+            if normalize_image_to_png "$local_art" "$cart_dir/cover.png"; then
+                cp -f "$cart_dir/cover.png" "$cart_dir/icon.png"
+                cover="cover.png"
+                break
+            fi
+        fi
+    done
+    if [ -z "$cover" ] && [ -s "$cart_dir/cover.png" ]; then
+        cp -f "$cart_dir/cover.png" "$cart_dir/icon.png"
+        cover="cover.png"
+    fi
+    if [ -z "$cover" ] && { [ "$kind" = movie ] || [ "$kind" = music ]; }; then
+        printf '%s\t%s\n' "$kind" "$source" > "$cart_dir/.media-cover-query"
+        rm -f "$cart_dir/.cover-query"
+    elif [ -z "$cover" ] && [ "$kind" = show ]; then
+        rm -f "$cart_dir/.cover-query" "$cart_dir/.media-cover-query"
+    elif [ -z "$cover" ]; then
+        printf '%s\t%s\n' "$platform" "$stem" > "$cart_dir/.cover-query"
+        rm -f "$cart_dir/.media-cover-query"
+    else
+        rm -f "$cart_dir/.cover-query" "$cart_dir/.media-cover-query"
+    fi
+
+    case "$kind" in
+        nintendo64)
+            gamescope_options="-w 960 -h 720 -W 1920 -H 1080 --filter linear"
+            ;;
+        wii|gamecube|wiiu|ps2|psp)
+            gamescope_options="--filter linear"
+            ;;
+        *)
+            gamescope_options="--filter pixel"
+            ;;
+    esac
+
+    if [ "$kind" = movie ] || [ "$kind" = music ] || [ "$kind" = show ]; then
+        if [ "$kind" = movie ] || [ "$kind" = show ]; then
+            cat > "$cart_dir/run" <<EOF
+#!/usr/bin/env bash
+exec /usr/local/bin/playfusion-movie "\$PWD/game/$safe_filename"
+EOF
+        else
+            cat > "$cart_dir/run" <<EOF
+#!/usr/bin/env bash
+exec /usr/local/bin/super-kazeta-jukebox "\$PWD/game/$safe_filename" --ordered 25
+EOF
+        fi
+        chmod 755 "$cart_dir/run"
+        printf '%s\n' "$source" > "$cart_dir/.media-source"
+        printf '%s\n' "$kind" > "$cart_dir/.media-kind"
+    fi
+
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$stem
+Id=$cart_id
+Exec=$(if [ "$kind" = movie ] || [ "$kind" = music ] || [ "$kind" = show ]; then printf './run'; else printf 'game/%s' "$safe_filename"; fi)
+Icon=icon.png
+Runtime=$runtime
+GamescopeOptions=$gamescope_options
+EOF
+    [ "$set_default" != true ] || printf 'SetAsDefaultGame=true\n' >> "$cart_dir/cart.kzi"
+    [ -z "$cover" ] || printf 'Cover=%s\n' "$cover" >> "$cart_dir/cart.kzi"
+    [ "$kind" != wii ] || printf 'WiiGamepad=true\n' >> "$cart_dir/cart.kzi"
+    chmod -R a+rX "$cart_dir"
+
+    CREATED_CART_ID=$cart_id
+    CREATED_CART_DIR=$cart_dir
+}
+
+download_pending_covers() {
+    local search_root=$1 query cart_dir platform title kind source
+    [ -d "$search_root" ] || return 0
+
+    # Known ROM catalogs are fast and deterministic, so complete those first.
+    while IFS= read -r -d '' query; do
+        cart_dir=$(dirname "$query")
+        IFS=$'\t' read -r platform title < "$query" || continue
+        if cache_catalog_cover "$cart_dir" "$platform" "$title"; then
+            grep -q '^Cover=' "$cart_dir/cart.kzi" ||
+                printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+            rm -f "$query"
+            propagate_cart_artwork "$cart_dir"
+            log "Downloaded artwork for $title."
+        fi
+    done < <(find "$search_root" -type f -name .cover-query -print0 2>/dev/null)
+
+    while IFS= read -r -d '' query; do
+        cart_dir=$(dirname "$query")
+        IFS=$'\t' read -r kind source < "$query" || continue
+        if cache_media_library_cover "$cart_dir" "$kind" "$source"; then
+            grep -q '^Cover=' "$cart_dir/cart.kzi" ||
+                printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+            sed -i 's/^Cover=cover\.jpg$/Cover=cover.png/' "$cart_dir/cart.kzi"
+            rm -f "$query"
+            log "Downloaded artwork for $(basename "$source")."
+        fi
+    done < <(
+        find "$search_root" -type f -name .media-cover-query -print0 2>/dev/null
+    )
+}
+
+propagate_cart_artwork() {
+    local cart_dir=$1 cart_id destination
+    [ -s "$cart_dir/cover.png" ] || return 0
+    cart_id=$(sed -n 's/^Id=//p' "$cart_dir/cart.kzi" | head -n 1)
+    [ -n "$cart_id" ] || return 0
+
+    while IFS= read -r destination; do
+        [ -d "$destination" ] || continue
+        cp -f "$cart_dir/cover.png" "$destination/cover.png"
+        cp -f "$cart_dir/icon.png" "$destination/icon.png"
+        if [ -f "$destination/metadata.kzi" ]; then
+            cp -f "$cart_dir/cart.kzi" "$destination/metadata.kzi"
+        elif [ -f "$destination/cart.kzi" ]; then
+            cp -f "$cart_dir/cart.kzi" "$destination/cart.kzi"
+        fi
+        chown --reference="$destination" \
+            "$destination/cover.png" "$destination/icon.png" 2>/dev/null || true
+    done < <(
+        printf '%s\n' "/var/kazeta/cache/$cart_id"
+        find /var/kazeta/internal-games /var/kazeta/storage \
+            -mindepth 1 -maxdepth 5 -type d -name "$cart_id" \
+            -print 2>/dev/null
+    )
+}
+
+schedule_cover_worker() {
+    local search_root=$1 helper
+    find "$search_root" -type f \
+        \( -name .cover-query -o -name .media-cover-query \) \
+        -print -quit 2>/dev/null |
+        grep -q . || return 0
+    helper=$(readlink -f "$0")
+    systemctl is-active --quiet playfusion-rom-covers.service && return 0
+    systemctl reset-failed playfusion-rom-covers.service 2>/dev/null || true
+    systemd-run --quiet --collect --unit=playfusion-rom-covers \
+        "$helper" covers "$search_root" >/dev/null 2>&1 || true
+}
+
+cached_cart_root() {
+    local cart_id
+    if [ -r "$STATE_DIR/count" ]; then
+        printf '%s\n' "$CACHE_ROOT/collection"
+        return
+    fi
+    cart_id=$(cat "$STATE_DIR/cart-id" 2>/dev/null || true)
+    [ -n "$cart_id" ] && printf '%s\n' "$CACHE_ROOT/$cart_id/cart"
+}
+
+publish_single_cart() {
+    local source=$1 platform=$2 runtime=$3 kind=$4
+
+    create_cart_files "$source" "$platform" "$runtime" "$kind" "" true || return 1
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$CREATED_CART_DIR" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+    printf '%s\n' "$source" > "$STATE_DIR/source"
+    printf '%s\n' "$CREATED_CART_ID" > "$STATE_DIR/cart-id"
+    touch "$STATE_DIR/ready"
+    schedule_cover_worker "$CREATED_CART_DIR"
+    log "$(basename "$source") is ready as virtual cart $CREATED_CART_ID."
+}
+
+publish_cart_collection() {
+    local manifest=$1 collection="$CACHE_ROOT/collection"
+    local file platform runtime kind created=0
+
+    remove_virtual_cart
+    if [ -r "$collection/.manifest" ] &&
+        [ "$(cat "$collection/.manifest")" = "$manifest" ]; then
+        created=$(find "$collection" -mindepth 2 -maxdepth 2 -type f \
+            -name cart.kzi | wc -l)
+    else
+        rm -rf -- "$collection"
+        mkdir -p "$collection"
+        while IFS=$'\t' read -r file platform runtime kind; do
+            [ -r "$file" ] || continue
+            if create_cart_files "$file" "$platform" "$runtime" "$kind" "$collection" false; then
+                created=$((created + 1))
+            fi
+        done <<< "$manifest"
+        [ "$created" -gt 0 ] || {
+            rm -rf -- "$collection"
+            return 1
+        }
+        printf '%s\n' "$manifest" > "$collection/.manifest"
+    fi
+    mkdir -p "$STATE_DIR" "$VISIBLE_CART"
+
+    mount --bind "$collection" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+    printf '%s\n' "$manifest" > "$STATE_DIR/manifest"
+    printf '%s\n' "$created" > "$STATE_DIR/count"
+    touch "$STATE_DIR/ready"
+    schedule_cover_worker "$collection"
+    log "$created games and media files are ready in the Play browser."
+}
+
+scan_media() {
+    local existing result line_count file platform runtime kind
+
+    result=$(find_supported_roms || true)
+    [ -n "$result" ] || {
+        remove_virtual_cart
+        return 1
+    }
+    existing=$(cat "$STATE_DIR/manifest" 2>/dev/null || true)
+    if [ "$existing" = "$result" ] && mountpoint -q "$VISIBLE_CART"; then
+        schedule_cover_worker "$(cached_cart_root)"
+        return 0
+    fi
+    remove_virtual_cart
+
+    line_count=$(printf '%s\n' "$result" | sed '/^[[:space:]]*$/d' | wc -l)
+    if [ "$line_count" -eq 1 ]; then
+        IFS=$'\t' read -r file platform runtime kind <<< "$result"
+        [ -r "$file" ] || return 1
+        publish_single_cart "$file" "$platform" "$runtime" "$kind"
+    else
+        publish_cart_collection "$result"
+    fi
+    printf '%s\n' "$result" > "$STATE_DIR/manifest"
+}
+
+settle_media() {
+    local attempt
+    for attempt in $(seq 1 16); do
+        if scan_media; then
+            return 0
+        fi
+        sleep 0.25
+    done
+    return 0
+}
+
+case "${1:-}" in
+    scan) scan_media ;;
+    settle) settle_media ;;
+    remove) remove_virtual_cart ;;
+    probe)
+        [ "$#" -eq 2 ] || {
+            printf 'Usage: %s probe FILE\n' "$0" >&2
+            exit 2
+        }
+        probe_by_extension "$2"
+        ;;
+    covers)
+        [ "$#" -eq 2 ] || {
+            printf 'Usage: %s covers DIRECTORY\n' "$0" >&2
+            exit 2
+        }
+        download_pending_covers "$2"
+        ;;
+    *)
+        printf 'Usage: %s {scan|settle|remove|probe FILE}\n' "$0" >&2
+        exit 2
+        ;;
+esac

@@ -1,0 +1,83 @@
+#!/bin/bash
+set -uo pipefail
+
+LIBRARY_DIR=/var/kazeta/internal-games
+[ -d "$LIBRARY_DIR" ] || exit 0
+
+rewrite_cover_field() {
+    local kzi_file="$1"
+    local value="${2:-}"
+    local temporary="${kzi_file}.normalize-$$"
+
+    if [ -n "$value" ]; then
+        awk -v replacement="Cover=$value" '
+            BEGIN { replaced = 0 }
+            /^[[:space:]]*Cover[[:space:]]*=/ {
+                if (!replaced) {
+                    print replacement
+                    replaced = 1
+                }
+                next
+            }
+            { print }
+            END {
+                if (!replaced) {
+                    print replacement
+                }
+            }
+        ' "$kzi_file" > "$temporary"
+    else
+        awk '
+            !/^[[:space:]]*Cover[[:space:]]*=/
+        ' "$kzi_file" > "$temporary"
+    fi
+
+    chown --reference="$kzi_file" "$temporary"
+    chmod --reference="$kzi_file" "$temporary"
+    mv -f "$temporary" "$kzi_file"
+}
+
+while IFS= read -r -d '' kzi_file; do
+    game_dir=$(dirname "$kzi_file")
+    game_root=$(realpath -e -- "$game_dir") || continue
+    cover=$(sed -n \
+        's/^[[:space:]]*Cover[[:space:]]*=[[:space:]]*//p' \
+        "$kzi_file" | head -n 1)
+    [ -n "$cover" ] || continue
+    [ "$cover" != ".kazeta-cover.png" ] || continue
+    [[ "$cover" != /* ]] || {
+        rewrite_cover_field "$kzi_file"
+        continue
+    }
+
+    source_path=$(realpath -e -- "$game_root/$cover" 2>/dev/null) || {
+        rewrite_cover_field "$kzi_file"
+        continue
+    }
+    case "$source_path" in
+        "$game_root"/*) ;;
+        *)
+            rewrite_cover_field "$kzi_file"
+            continue
+            ;;
+    esac
+
+    if [ "$(file -Lb --mime-type "$source_path" 2>/dev/null)" = "image/png" ]; then
+        continue
+    fi
+
+    output_path="$game_root/.kazeta-cover.png"
+    temporary_image="$game_root/.kazeta-cover-$$.tmp.png"
+    if ffmpeg -nostdin -hide_banner -loglevel error -y \
+        -i "$source_path" -frames:v 1 "$temporary_image"; then
+        chown --reference="$kzi_file" "$temporary_image"
+        chmod 0644 "$temporary_image"
+        mv -f "$temporary_image" "$output_path"
+        rewrite_cover_field "$kzi_file" ".kazeta-cover.png"
+        echo "Normalized cover for $(basename "$game_root")"
+    else
+        rm -f "$temporary_image"
+        rewrite_cover_field "$kzi_file"
+        echo "Rejected unreadable cover for $(basename "$game_root")" >&2
+    fi
+done < <(find "$LIBRARY_DIR" -mindepth 2 -maxdepth 3 -type f -iname '*.kzi' -print0)

@@ -1,0 +1,43 @@
+# Allow the gamer user to run the overlayfs mount helper without a password
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-mount
+
+# Allow running the log copy helper script without a password
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-copy-logs
+
+# Allow the error screen helper
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-show-error
+
+# Wi-Fi
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-wifi-setup
+
+# Runtime Downloader Helper
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-runtime-helper
+
+# Internal Games install/delete helper (validates all paths and IDs)
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-internal-game-helper
+
+# Import user-owned BIOS/firmware from removable media
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/playfusion-bios-manager
+
+# Register controllers and apply per-system Xbox-style layouts
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/playfusion-controller-setup
+
+# Bluetooth
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/bluetoothctl
+
+# Allow passwordless execution of nmcli to manage networking
+%wheel ALL=(ALL) NOPASSWD: /usr/bin/nmcli
+
+# Allow passwordless execution of rfkill to manage wireless devices (Bluetooth specifically)
+%wheel ALL=(ALL) NOPASSWD: /usr/sbin/rfkill
+
+# kazeta+ upgrade
+%wheel ALL=(ALL:ALL) NOPASSWD: /tmp/kazeta-plus-upgrade-kit-*/upgrade-to-plus.sh
+
+# Allow the gamer user to run rm on the kazeta work and save cache dirs
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/rm -rf /home/gamer/.local/share/kazeta/run/work
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/rm -rf /home/gamer/.local/share/kazeta/saves/default/*/.kazeta/share
+
+# Allow passwordless reboot and shutdown
+%wheel ALL=(ALL) NOPASSWD: /usr/sbin/reboot
+%wheel ALL=(ALL) NOPASSWD: /usr/sbin/shutdown

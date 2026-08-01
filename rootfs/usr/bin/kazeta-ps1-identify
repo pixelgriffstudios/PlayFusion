@@ -1,0 +1,95 @@
+#!/usr/bin/python3
+"""Read a PS1 serial and volume label directly from a raw Mode-2 CD stream."""
+
+from __future__ import annotations
+
+import re
+import sys
+from pathlib import Path
+
+RAW_SECTOR_SIZE = 2352
+MODE2_DATA_OFFSET = 24
+ISO_SECTOR_SIZE = 2048
+
+
+def fail(message: str) -> "NoReturn":
+    print(message, file=sys.stderr)
+    raise SystemExit(1)
+
+
+def read_mode2_sector(handle, lba: int) -> bytes:
+    handle.seek(lba * RAW_SECTOR_SIZE)
+    raw = handle.read(RAW_SECTOR_SIZE)
+    if len(raw) != RAW_SECTOR_SIZE:
+        fail(f"short raw-sector read at LBA {lba}")
+    if raw[15] != 2:
+        fail(f"LBA {lba} is not a Mode-2 sector")
+    return raw[MODE2_DATA_OFFSET : MODE2_DATA_OFFSET + ISO_SECTOR_SIZE]
+
+
+def read_extent(handle, lba: int, byte_count: int) -> bytes:
+    result = bytearray()
+    sector_count = (byte_count + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
+    for offset in range(sector_count):
+        result.extend(read_mode2_sector(handle, lba + offset))
+    return bytes(result[:byte_count])
+
+
+def find_system_cnf(handle, root_lba: int, root_size: int) -> tuple[int, int]:
+    sector_count = (root_size + ISO_SECTOR_SIZE - 1) // ISO_SECTOR_SIZE
+    for sector_offset in range(sector_count):
+        directory = read_mode2_sector(handle, root_lba + sector_offset)
+        cursor = 0
+        while cursor < ISO_SECTOR_SIZE:
+            record_length = directory[cursor]
+            if record_length == 0:
+                break
+            record = directory[cursor : cursor + record_length]
+            if len(record) < 34:
+                fail("invalid ISO9660 directory record")
+            extent_lba = int.from_bytes(record[2:6], "little")
+            data_size = int.from_bytes(record[10:14], "little")
+            name_length = record[32]
+            name = record[33 : 33 + name_length].decode("ascii", "replace")
+            normalized = name.split(";", 1)[0].rstrip(".").upper()
+            if normalized == "SYSTEM.CNF":
+                return extent_lba, data_size
+            cursor += record_length
+    fail("SYSTEM.CNF was not found in the PS1 root directory")
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        fail(f"usage: {Path(sys.argv[0]).name} RAW_DISC_BIN")
+
+    with open(sys.argv[1], "rb", buffering=0) as handle:
+        pvd = read_mode2_sector(handle, 16)
+        if pvd[0] != 1 or pvd[1:6] != b"CD001":
+            fail("raw disc does not contain an ISO9660 primary volume descriptor")
+
+        volume_label = pvd[40:72].decode("ascii", "replace").strip()
+        root_length = pvd[156]
+        root = pvd[156 : 156 + root_length]
+        if len(root) < 34:
+            fail("invalid ISO9660 root directory record")
+        root_lba = int.from_bytes(root[2:6], "little")
+        root_size = int.from_bytes(root[10:14], "little")
+
+        system_lba, system_size = find_system_cnf(handle, root_lba, root_size)
+        system_cnf = read_extent(handle, system_lba, system_size).decode(
+            "ascii", "replace"
+        )
+
+    match = re.search(
+        r"(?im)^\s*BOOT\s*=\s*.*\\([^;\s]+)",
+        system_cnf,
+    )
+    if not match:
+        fail("SYSTEM.CNF does not contain a PS1 BOOT entry")
+
+    print(f"{match.group(1)}\t{volume_label}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,51 @@
+#! /bin/bash
+
+if [ $EUID -ne 0 ]; then
+        echo "$(basename $0) must be run as root"
+        exit 1
+fi
+
+# kzp mounting support
+if [ "$1" == "kzp" ]; then
+	if [ "$2" == "--unmount" ]; then
+		umount -l "$3"
+	else
+		mount -o loop "$2" "$3"
+	fi
+
+	exit 0
+fi
+
+if [ "$1" == "--unmount" ]; then
+	#umount "$2"
+	#umount "$3"
+	# Use -l for a "lazy" unmount, which is more reliable in cleanup scripts
+	umount -l "$2"
+	umount -l "$3"
+else
+	lowerdir="$1"
+	upperdir="$2"
+	workdir="$3"
+	targetdir="$4"
+	runtime="$5"
+	runtimedir="$6"
+
+	# A hard reset can leave lazy OverlayFS/loop mounts behind even after the
+	# old game process has exited. Release every mount visible in this
+	# namespace before reusing the shared work and target directories.
+	mountpoint -q "$targetdir" && umount -l "$targetdir"
+	mountpoint -q "$runtimedir" && umount -l "$runtimedir"
+	rm -rf "$workdir"
+	rm -rf "$targetdir"
+	rm -rf "$runtimedir"
+	mkdir -p "$workdir"
+	mkdir -p "$targetdir"
+	mkdir -p "$runtimedir"
+
+	mount "$runtime" "$runtimedir"
+
+	# metacopy=on reduces pressure-vessel writes. index=off also permits safe
+	# recovery when a lazy mount survives in an older, otherwise dead mount
+	# namespace after Reset.
+	mount -t overlay overlay -o index=off,metacopy=on,lowerdir="$lowerdir:$runtimedir",upperdir="$upperdir",workdir="$workdir" "$targetdir"
+fi

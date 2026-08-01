@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover SHANWAN gamepad interface after cold boot
+After=systemd-udev-trigger.service
+Before=getty@tty1.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/super-kazeta-controller-recover
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+[Unit]
+Description=Normalize Kazeta internal-game covers
+After=local-fs.target
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/kazeta-normalize-internal-covers

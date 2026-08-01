@@ -1,0 +1,27 @@
+[Unit]
+Description=PlayFusion Games, Runtimes, Firmware, Movies, and Music FTP Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/mkdir -p /var/kazeta/internal-games /var/kazeta/runtime-uploads /var/kazeta/firmware/ps2 /var/kazeta/movies /var/kazeta/music /var/kazeta/ftp/internal-games /var/kazeta/ftp/runtimes /var/kazeta/ftp/firmware /var/kazeta/ftp/movies /var/kazeta/ftp/music
+ExecStartPre=/usr/bin/chown kazetaftp:kazetaftp /var/kazeta/internal-games /var/kazeta/runtime-uploads /var/kazeta/firmware /var/kazeta/firmware/ps2 /var/kazeta/movies /var/kazeta/music
+ExecStart=/usr/bin/vsftpd /etc/vsftpd-kazeta-internal.conf
+Restart=on-failure
+RestartSec=3
+PrivateTmp=yes
+ProtectSystem=strict
+BindPaths=/var/kazeta/internal-games:/var/kazeta/ftp/internal-games
+BindPaths=/var/kazeta/runtime-uploads:/var/kazeta/ftp/runtimes
+BindPaths=/var/kazeta/firmware:/var/kazeta/ftp/firmware
+BindPaths=/var/kazeta/movies:/var/kazeta/ftp/movies
+BindPaths=/var/kazeta/music:/var/kazeta/ftp/music
+ReadWritePaths=/var/kazeta/internal-games
+ReadWritePaths=/var/kazeta/runtime-uploads
+ReadWritePaths=/var/kazeta/firmware
+ReadWritePaths=/var/kazeta/movies
+ReadWritePaths=/var/kazeta/music
+
+[Install]
+WantedBy=multi-user.target

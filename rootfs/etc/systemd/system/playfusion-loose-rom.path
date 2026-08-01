@@ -1,0 +1,10 @@
+[Unit]
+Description=Watch removable media for a single loose ROM
+
+[Path]
+PathChanged=/run/media
+Unit=playfusion-loose-rom.service
+MakeDirectory=true
+
+[Install]
+WantedBy=multi-user.target

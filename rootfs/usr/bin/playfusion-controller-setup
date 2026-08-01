@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROFILE_ROOT="${PROFILE_ROOT:-/var/kazeta/controller-profiles}"
+SYSTEM_ROOT="${SYSTEM_ROOT:-$PROFILE_ROOT/systems}"
+DEVICE_ROOT="${DEVICE_ROOT:-/etc/inputplumber/devices}"
+DEFAULT_PROFILE="${DEFAULT_PROFILE:-/usr/share/inputplumber/profiles/default.yaml}"
+
+fail() {
+    printf 'ERROR\t%s\n' "$*" >&2
+    exit 1
+}
+
+safe_key() {
+    printf '%s' "$1" |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+/-/g; s/^-+|-+$//g'
+}
+
+yaml_quote() {
+    printf '%s' "$1" | sed "s/'/''/g"
+}
+
+physical_controllers() {
+    local link event sys name vendor product key
+    shopt -s nullglob
+    for link in /dev/input/by-id/*-event-joystick; do
+        event=$(readlink -f -- "$link") || continue
+        [[ "$event" == /dev/input/event* ]] || continue
+        sys="/sys/class/input/$(basename "$event")/device"
+        [[ -r "$sys/name" ]] || continue
+        name=$(tr -d '\n' < "$sys/name")
+        [[ "$name" != InputPlumber* && "$name" != "keyd virtual"* ]] || continue
+        vendor=$(cat "$sys/id/vendor" 2>/dev/null || printf '0000')
+        product=$(cat "$sys/id/product" 2>/dev/null || printf '0000')
+        key=$(safe_key "$vendor-$product-$name")
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$event" "$name" "$vendor" "$product" "$key" "$link"
+    done
+}
+
+managed_controller_names() {
+    inputplumber devices list 2>/dev/null |
+        sed -nE 's/.*│ [0-9]+[[:space:]]*│ (.*[^[:space:]])[[:space:]]*│.*/\1/p'
+}
+
+list_controllers() {
+    local managed event name vendor product key link status
+    managed=$(managed_controller_names || true)
+    while IFS=$'\t' read -r event name vendor product key link; do
+        [[ -n "$event" ]] || continue
+        status=UNMANAGED
+        if grep -Fqx "$name" <<<"$managed"; then
+            status=XBOX_READY
+        elif [[ -f "$DEVICE_ROOT/90-playfusion-$key.yaml" ]]; then
+            status=REGISTERED
+        fi
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$event" "$name" "$vendor" "$product" "$status" "$link"
+    done < <(physical_controllers)
+}
+
+register_controller() {
+    local requested="${1:-}" event name vendor product key link output
+    if [[ -n "$requested" ]]; then
+        output=$(physical_controllers | awk -F '\t' -v wanted="$requested" \
+            '$1 == wanted || $6 == wanted { print; exit }')
+    else
+        output=$(list_controllers | awk -F '\t' '$5 == "UNMANAGED" { print; exit }')
+        if [[ -n "$output" ]]; then
+            IFS=$'\t' read -r event name vendor product _ link <<<"$output"
+            key=$(safe_key "$vendor-$product-$name")
+            output=$(printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$event" "$name" "$vendor" "$product" "$key" "$link")
+        fi
+    fi
+    [[ -n "$output" ]] || fail "No unsupported controller is connected"
+    IFS=$'\t' read -r event name vendor product key link <<<"$output"
+    [[ -e "$event" ]] || fail "Controller disconnected"
+
+    mkdir -p "$DEVICE_ROOT"
+    cat >"$DEVICE_ROOT/90-playfusion-$key.yaml" <<EOF
+version: 1
+kind: CompositeDevice
+name: PlayFusion Xbox - $(yaml_quote "$name")
+single_source: true
+matches: []
+source_devices:
+  - group: gamepad
+    evdev:
+      name: '$(yaml_quote "$name")'
+      vendor_id: '$vendor'
+      product_id: '$product'
+      handler: event*
+options:
+  auto_manage: true
+target_devices:
+  - xb360
+capability_map_id: dinput_generic
+EOF
+    chmod 0644 "$DEVICE_ROOT/90-playfusion-$key.yaml"
+    if [[ "${NO_RESTART:-0}" != 1 ]]; then
+        systemctl restart inputplumber
+        sleep 2
+        inputplumber devices manage-all --enable >/dev/null
+    fi
+    printf 'REGISTERED\t%s\t%s\t%s:%s\n' "$name" "$event" "$vendor" "$product"
+}
+
+profile_mapping() {
+    case "$1" in
+        xbox-standard)
+            return 0
+            ;;
+        nintendo-face)
+            cat <<'EOF'
+  - name: South to East
+    source_event: { gamepad: { button: South } }
+    target_events: [ { gamepad: { button: East } } ]
+  - name: East to South
+    source_event: { gamepad: { button: East } }
+    target_events: [ { gamepad: { button: South } } ]
+  - name: West to North
+    source_event: { gamepad: { button: West } }
+    target_events: [ { gamepad: { button: North } } ]
+  - name: North to West
+    source_event: { gamepad: { button: North } }
+    target_events: [ { gamepad: { button: West } } ]
+EOF
+            ;;
+        swap-ab)
+            cat <<'EOF'
+  - name: Swap A to B
+    source_event: { gamepad: { button: South } }
+    target_events: [ { gamepad: { button: East } } ]
+  - name: Swap B to A
+    source_event: { gamepad: { button: East } }
+    target_events: [ { gamepad: { button: South } } ]
+EOF
+            ;;
+        swap-xy)
+            cat <<'EOF'
+  - name: Swap X to Y
+    source_event: { gamepad: { button: West } }
+    target_events: [ { gamepad: { button: North } } ]
+  - name: Swap Y to X
+    source_event: { gamepad: { button: North } }
+    target_events: [ { gamepad: { button: West } } ]
+EOF
+            ;;
+        *) fail "Unknown controller preset: $1" ;;
+    esac
+}
+
+set_system_profile() {
+    local system preset key destination
+    system="${1:-}"
+    preset="${2:-}"
+    [[ -n "$system" && -n "$preset" ]] ||
+        fail "Usage: set-system SYSTEM PRESET"
+    key=$(safe_key "$system")
+    [[ -n "$key" ]] || fail "Invalid system name"
+    mkdir -p "$SYSTEM_ROOT"
+    destination="$SYSTEM_ROOT/$key.yaml"
+    {
+        printf 'version: 1\n'
+        printf 'kind: DeviceProfile\n'
+        printf "name: 'PlayFusion %s - %s'\n" \
+            "$(yaml_quote "$system")" "$(yaml_quote "$preset")"
+        printf "description: 'Xbox-normalized PlayFusion system layout'\n"
+        if [[ "$preset" == xbox-standard ]]; then
+            printf 'mapping: []\n'
+        else
+            printf 'mapping:\n'
+            profile_mapping "$preset"
+        fi
+    } >"$destination"
+    chmod 0664 "$destination"
+    printf '%s\n' "$preset" >"$SYSTEM_ROOT/$key.preset"
+    chmod 0664 "$SYSTEM_ROOT/$key.preset"
+    printf 'SAVED\t%s\t%s\t%s\n' "$system" "$preset" "$destination"
+}
+
+get_system_profile() {
+    local key preset
+    key=$(safe_key "${1:-}")
+    preset="$SYSTEM_ROOT/$key.preset"
+    if [[ -f "$preset" ]]; then
+        tr -d '\r\n' <"$preset"
+    else
+        printf 'xbox-standard'
+    fi
+    printf '\n'
+}
+
+system_for_game() {
+    local runtime="${1,,}" executable="${2,,}"
+    case "$runtime:$executable" in
+        *pcsx2*:*|*playstation2*:*) printf 'PlayStation 2' ;;
+        *duckstation*:*|*playstation*:*) printf 'PlayStation' ;;
+        *cemu*:*|*wii-u*:*|*wiiu*:*) printf 'Wii U' ;;
+        *dolphin*:*) printf 'Wii' ;;
+        *ppsspp*:*) printf 'PSP' ;;
+        *vita3k*:*) printf 'PlayStation Vita' ;;
+        *xemu*:*) printf 'Original Xbox' ;;
+        *azahar*:*|*citra*:*) printf 'Nintendo 3DS' ;;
+        *snes*:*|*:*.smc|*:*.sfc) printf 'SNES' ;;
+        *n64*:*|*:*.n64|*:*.z64|*:*.v64) printf 'Nintendo 64' ;;
+        *genesis*:*|*picodrive*:*|*:*.md|*:*.gen) printf 'Sega Genesis' ;;
+        *nes*:*|*:*.nes) printf 'NES' ;;
+        *mame*:*|*fbneo*:*|*arcade*:*) printf 'Arcade' ;;
+        windows*:*|linux*:*) printf 'PC Games' ;;
+        *) printf 'Default' ;;
+    esac
+}
+
+apply_system_profile() {
+    local runtime="${1:-}" executable="${2:-}" system key profile
+    system=$(system_for_game "$runtime" "$executable")
+    key=$(safe_key "$system")
+    profile="$SYSTEM_ROOT/$key.yaml"
+    [[ -f "$profile" ]] || return 0
+    busctl call org.shadowblip.InputPlumber \
+        /org/shadowblip/InputPlumber/CompositeDevice0 \
+        org.shadowblip.Input.CompositeDevice \
+        LoadProfilePath "s" "$profile" >/dev/null
+    printf 'APPLIED\t%s\t%s\n' "$system" "$profile"
+}
+
+case "${1:-}" in
+    list)
+        list_controllers
+        ;;
+    register)
+        register_controller "${2:-}"
+        ;;
+    set-system)
+        set_system_profile "${2:-}" "${3:-}"
+        ;;
+    get-system)
+        get_system_profile "${2:-}"
+        ;;
+    apply-game)
+        apply_system_profile "${2:-}" "${3:-}"
+        ;;
+    *)
+        fail "Usage: $0 list | register [EVENT] | set-system SYSTEM PRESET | get-system SYSTEM | apply-game RUNTIME EXEC"
+        ;;
+esac

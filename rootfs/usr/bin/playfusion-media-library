@@ -1,0 +1,1072 @@
+#!/usr/bin/env python3
+"""Discover, identify, play, and install PlayFusion movie/music media.
+
+The UI consumes the JSON emitted by ``list``.  Metadata is created immediately
+from filenames/tags, while artwork is refreshed in a detached worker so opening
+the library never waits on the network.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any, Iterable
+
+
+MOVIE_ROOT = Path("/var/kazeta/movies")
+MUSIC_ROOT = Path("/var/kazeta/music")
+CACHE_ROOT = Path("/var/kazeta/media-cache")
+STATE_ROOT = Path("/run/kazeta/media-library")
+PROGRESS_FILE = STATE_ROOT / "progress"
+
+MOVIE_EXTENSIONS = {
+    ".mp4",
+    ".mkv",
+    ".avi",
+    ".mov",
+    ".m4v",
+    ".webm",
+    ".mpg",
+    ".mpeg",
+    ".ts",
+    ".m2ts",
+}
+MUSIC_EXTENSIONS = {
+    ".mp3",
+    ".wav",
+    ".flac",
+    ".ogg",
+    ".opus",
+    ".m4a",
+    ".aac",
+    ".wma",
+}
+IGNORED_DIRS = {
+    ".git",
+    "$recycle.bin",
+    "system volume information",
+    "lost+found",
+    "__macosx",
+    "games",
+    "metadata",
+    "runtimes",
+    "runtime-uploads",
+    "firmware",
+    "bios",
+}
+USER_AGENT = "PlayFusion/1.0 (local media metadata client)"
+
+
+def sanitize_text(value: str) -> str:
+    value = value.replace("\x00", " ").replace("\t", " ").replace("\n", " ")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def safe_name(value: str, fallback: str = "Unknown") -> str:
+    value = sanitize_text(value)
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", value).strip(" .")
+    return value[:120] or fallback
+
+
+def media_id(kind: str, fields: dict[str, Any]) -> str:
+    if kind == "movies":
+        identity = (
+            f"{fields.get('title', '')}|{fields.get('year', '')}|"
+            f"{fields.get('format', '')}"
+        ).lower()
+    else:
+        identity = (
+            f"{fields.get('artist', '')}|{fields.get('album', '')}|"
+            f"{fields.get('title', '')}|{fields.get('format', '')}"
+        ).lower()
+    return f"{kind[:-1]}-{hashlib.sha1(identity.encode('utf-8')).hexdigest()[:16]}"
+
+
+def cache_dir(item_id: str) -> Path:
+    return CACHE_ROOT / item_id
+
+
+def cache_metadata_path(item_id: str) -> Path:
+    return cache_dir(item_id) / "metadata.json"
+
+
+def cache_cover_path(item_id: str) -> Path:
+    return cache_dir(item_id) / "cover.png"
+
+
+def request_json(url: str, timeout: float = 8.0) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.load(response)
+
+
+def convert_image_to_png(source: Path, destination: Path) -> bool:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".part.png")
+    temporary.unlink(missing_ok=True)
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/ffmpeg",
+                "-nostdin",
+                "-loglevel",
+                "error",
+                "-y",
+                "-i",
+                str(source),
+                "-frames:v",
+                "1",
+                str(temporary),
+            ],
+            timeout=20,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        temporary.unlink(missing_ok=True)
+        return False
+    try:
+        valid = (
+            completed.returncode == 0
+            and temporary.is_file()
+            and temporary.read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+        )
+    except OSError:
+        valid = False
+    if not valid:
+        temporary.unlink(missing_ok=True)
+        return False
+    os.replace(temporary, destination)
+    destination.chmod(0o644)
+    return True
+
+
+def download_image(url: str, destination: Path, timeout: float = 10.0) -> bool:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            content = response.read(8 * 1024 * 1024)
+    except (OSError, urllib.error.URLError):
+        return False
+    signatures = (
+        content.startswith(b"\x89PNG\r\n\x1a\n"),
+        content.startswith(b"\xff\xd8\xff"),
+        content.startswith(b"RIFF") and content[8:12] == b"WEBP",
+    )
+    if not any(signatures):
+        return False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source = destination.with_name(destination.name + ".download")
+    source.write_bytes(content)
+    try:
+        return convert_image_to_png(source, destination)
+    finally:
+        source.unlink(missing_ok=True)
+
+
+def parse_movie_filename(path: Path) -> dict[str, Any]:
+    stem = path.stem
+    year_match = re.search(r"[\(\[\s._-]((?:19|20)\d{2})[\)\]\s._-]?", stem)
+    year = year_match.group(1) if year_match else ""
+    title_part = stem[: year_match.start()] if year_match else stem
+    title_part = re.sub(
+        r"(?i)\b(?:2160p|1080p|720p|480p|4k|uhd|hdr10?|dv|bluray|brrip|"
+        r"webrip|web-dl|webdl|hdtv|x26[45]|h\.?26[45]|hevc|av1|aac\d*|"
+        r"dts(?:-hd)?|atmos|proper|repack|extended|unrated)\b.*$",
+        "",
+        title_part,
+    )
+    title = re.sub(r"[._]+", " ", title_part)
+    title = re.sub(r"\s+-\s+", " ", title)
+    title = sanitize_text(title).strip("- ")
+    return {
+        "title": title or sanitize_text(stem),
+        "year": year,
+        "artist": "",
+        "album": "",
+    }
+
+
+def ffprobe_tags(path: Path) -> dict[str, str]:
+    try:
+        completed = subprocess.run(
+            [
+                "/usr/bin/ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format_tags=artist,album_artist,title,album,date,track",
+                "-of",
+                "json",
+                str(path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+            check=False,
+        )
+        payload = json.loads(completed.stdout or "{}")
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return {}
+    tags = payload.get("format", {}).get("tags", {})
+    return {str(key).lower(): sanitize_text(str(value)) for key, value in tags.items()}
+
+
+def parse_music_filename(path: Path) -> dict[str, Any]:
+    # Keep catalog scans instant. Embedded tags are enriched by the detached
+    # artwork/metadata worker instead of blocking the controller UI.
+    tags: dict[str, str] = {}
+    stem = re.sub(r"^\s*\d{1,3}[\s._-]+", "", path.stem).strip()
+    parts = [sanitize_text(part) for part in re.split(r"\s+-\s+", stem) if part.strip()]
+    artist = tags.get("album_artist") or tags.get("artist") or ""
+    title = tags.get("title") or ""
+    if not title and len(parts) >= 2:
+        artist = artist or parts[0]
+        title = parts[-1]
+    if not title:
+        title = sanitize_text(stem)
+
+    album = tags.get("album") or ""
+    parent_name = sanitize_text(path.parent.name)
+    if not album and parent_name.lower() not in {"music", "audio", "songs"}:
+        album = parent_name
+        if not artist:
+            album_parts = [
+                sanitize_text(part)
+                for part in re.split(r"\s+-\s+", parent_name)
+                if part.strip()
+            ]
+            if len(album_parts) >= 2:
+                artist = album_parts[0]
+                album = album_parts[-1]
+
+    return {
+        "title": title or "Unknown Track",
+        "year": "",
+        "artist": artist or "Unknown Artist",
+        "album": album or "Singles",
+    }
+
+
+def load_or_create_metadata(kind: str, path: Path) -> dict[str, Any]:
+    parsed = parse_movie_filename(path) if kind == "movies" else parse_music_filename(path)
+    parsed["format"] = path.suffix.lower().lstrip(".")
+    item_id = media_id(kind, parsed)
+    metadata_path = cache_metadata_path(item_id)
+    cached: dict[str, Any] = {}
+    try:
+        cached = json.loads(metadata_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        pass
+    metadata = {**parsed, **cached, "id": item_id, "kind": kind}
+    metadata_path.parent.mkdir(parents=True, exist_ok=True)
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    metadata_path.chmod(0o644)
+    return metadata
+
+
+def is_supported(kind: str, path: Path) -> bool:
+    extensions = MOVIE_EXTENSIONS if kind == "movies" else MUSIC_EXTENSIONS
+    return path.is_file() and path.suffix.lower() in extensions
+
+
+def within(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def removable_roots() -> list[Path]:
+    override = os.environ.get("PLAYFUSION_MEDIA_ROOTS")
+    if override:
+        return [
+            Path(item).resolve()
+            for item in override.split(os.pathsep)
+            if item and Path(item).is_dir()
+        ]
+
+    candidates: list[Path] = []
+    for parent in (Path("/run/media"), Path("/media")):
+        if not parent.is_dir():
+            continue
+        for first in parent.iterdir():
+            if not first.is_dir():
+                continue
+            possible = [first]
+            try:
+                possible.extend(child for child in first.iterdir() if child.is_dir())
+            except OSError:
+                pass
+            for root in possible:
+                root_text = str(root)
+                if root_text.startswith(
+                    (
+                        "/run/media/frzr_efi",
+                        "/run/media/kazeta-optical",
+                        "/run/media/playfusion-loose-rom",
+                    )
+                ):
+                    continue
+                if not os.path.ismount(root):
+                    continue
+                candidates.append(root.resolve())
+
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for root in sorted(candidates, key=lambda item: len(str(item))):
+        key = str(root)
+        if key in seen or any(within(root, other) for other in unique):
+            continue
+        seen.add(key)
+        unique.append(root)
+    return unique
+
+
+def walk_media(root: Path, kind: str) -> Iterable[Path]:
+    try:
+        iterator = os.walk(root)
+    except OSError:
+        return
+    for directory, dirnames, filenames in iterator:
+        dirnames[:] = [
+            value
+            for value in dirnames
+            if not value.startswith(".") and value.lower() not in IGNORED_DIRS
+        ]
+        directory_path = Path(directory)
+        for filename in filenames:
+            path = directory_path / filename
+            if is_supported(kind, path):
+                yield path
+
+
+def preferred_local_cover(path: Path) -> Path | None:
+    directory = path if path.is_dir() else path.parent
+    for name in (
+        "cover.jpg",
+        "cover.jpeg",
+        "cover.png",
+        "folder.jpg",
+        "folder.png",
+        "poster.jpg",
+        "poster.png",
+    ):
+        candidate = directory / name
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def named_child_directories(root: Path, names: set[str]) -> list[Path]:
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return []
+    return sorted(
+        (
+            child
+            for child in children
+            if child.is_dir() and child.name.casefold() in names
+        ),
+        key=lambda child: child.name.casefold(),
+    )
+
+
+def show_directories(root: Path) -> list[Path]:
+    containers = named_child_directories(root, {"shows", "tv shows"})
+    shows: list[Path] = []
+    for container in containers:
+        try:
+            children = list(container.iterdir())
+        except OSError:
+            continue
+        shows.extend(
+            child
+            for child in children
+            if child.is_dir() and any(walk_media(child, "movies"))
+        )
+    return sorted(shows, key=lambda child: child.name.casefold())
+
+
+def show_item(path: Path, source: str) -> dict[str, Any]:
+    fields = {
+        "title": sanitize_text(path.name),
+        "year": "",
+        "format": "tv-show",
+    }
+    item_id = media_id("movies", fields)
+    local_cover = preferred_local_cover(path)
+    cached_cover = cache_cover_path(item_id)
+    cover = local_cover if local_cover else cached_cover if cached_cover.is_file() else None
+    size = 0
+    for episode in walk_media(path, "movies"):
+        try:
+            size += episode.stat().st_size
+        except OSError:
+            pass
+    return {
+        **fields,
+        "id": item_id,
+        "path": str(path.resolve()),
+        "cover": str(cover) if cover else "",
+        "size": size,
+        "source": source,
+        "installed": source == "internal",
+        "media_type": "show",
+    }
+
+
+def catalog(kind: str) -> list[dict[str, Any]]:
+    internal_root = MOVIE_ROOT if kind == "movies" else MUSIC_ROOT
+    internal_root.mkdir(parents=True, exist_ok=True)
+    CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    roots = [(internal_root, "internal")]
+    for root in removable_roots():
+        folder_names = {"movies"} if kind == "movies" else {"music"}
+        roots.extend(
+            (folder, "removable")
+            for folder in named_child_directories(root, folder_names)
+        )
+
+    items: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for root, source in roots:
+        for path in walk_media(root, kind):
+            if kind == "movies":
+                try:
+                    relative_parts = path.relative_to(root).parts
+                except ValueError:
+                    relative_parts = ()
+                if relative_parts and relative_parts[0].casefold() in {
+                    "shows",
+                    "tv shows",
+                }:
+                    continue
+            try:
+                resolved = path.resolve()
+                stat = resolved.stat()
+            except OSError:
+                continue
+            key = str(resolved)
+            if key in seen_paths:
+                continue
+            seen_paths.add(key)
+            metadata = load_or_create_metadata(kind, resolved)
+            local_cover = preferred_local_cover(resolved)
+            cached_cover = cache_cover_path(metadata["id"])
+            cover = local_cover if local_cover else cached_cover if cached_cover.is_file() else None
+            items.append(
+                {
+                    **metadata,
+                    "path": key,
+                    "cover": str(cover) if cover else "",
+                    "size": stat.st_size,
+                    "source": source,
+                    "installed": source == "internal",
+                    "media_type": "movie" if kind == "movies" else "music",
+                }
+            )
+
+    if kind == "movies":
+        show_roots = [(internal_root, "internal")]
+        show_roots.extend((root, "removable") for root in removable_roots())
+        for show_root, source in show_roots:
+            for show in show_directories(show_root):
+                key = str(show.resolve())
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                items.append(show_item(show, source))
+
+    if kind == "movies":
+        items.sort(
+            key=lambda item: (
+                item.get("title", "").lower(),
+                item.get("year", ""),
+                item["path"].lower(),
+            )
+        )
+    else:
+        items.sort(
+            key=lambda item: (
+                item.get("artist", "").lower(),
+                item.get("album", "").lower(),
+                item.get("title", "").lower(),
+            )
+        )
+    return items
+
+
+def refresh_movie_art(item: dict[str, Any]) -> bool:
+    title = item.get("title", "")
+    year = item.get("year", "")
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    def page_score(page: dict[str, Any]) -> int:
+        candidate = sanitize_text(page.get("title", ""))
+        candidate_normalized = normalized(candidate)
+        title_normalized = normalized(title)
+        score = 0
+        if page.get("missing"):
+            return -1000
+        if candidate_normalized == title_normalized:
+            score += 80
+        if candidate_normalized.startswith(title_normalized + " "):
+            score += 50
+        if "(film)" in candidate.lower():
+            score += 55
+        if year and year in candidate:
+            score += 40
+        if title_normalized not in candidate_normalized:
+            score -= 100
+        return score
+
+    def query_pages(request: dict[str, str]) -> list[dict[str, Any]]:
+        parameters = urllib.parse.urlencode(request)
+        try:
+            response = request_json(f"https://en.wikipedia.org/w/api.php?{parameters}")
+        except (OSError, urllib.error.URLError, json.JSONDecodeError):
+            return []
+        return response.get("query", {}).get("pages", [])
+
+    def poster_from_page(page: dict[str, Any]) -> str:
+        source = page.get("thumbnail", {}).get("source", "")
+        if source:
+            return source
+        page_title = sanitize_text(page.get("title", ""))
+        if not page_title:
+            return ""
+        image_pages = query_pages(
+            {
+                "action": "query",
+                "titles": page_title,
+                "prop": "images",
+                "imlimit": "max",
+                "format": "json",
+                "formatversion": "2",
+            }
+        )
+        image_names = [
+            image.get("title", "")
+            for image_page in image_pages
+            for image in image_page.get("images", [])
+        ]
+
+        def image_score(name: str) -> int:
+            lowered = name.lower()
+            score = 0
+            if "poster" in lowered:
+                score += 100
+            if "cover" in lowered or "dvd" in lowered or "blu-ray" in lowered:
+                score += 60
+            if normalized(title) in normalized(name):
+                score += 45
+            if lowered.endswith((".jpg", ".jpeg", ".png", ".webp")):
+                score += 10
+            if any(
+                token in lowered
+                for token in ("logo", "icon", "symbol", "actor", "actress", "premiere")
+            ):
+                score -= 80
+            return score
+
+        image_names.sort(key=image_score, reverse=True)
+        if not image_names or image_score(image_names[0]) < 60:
+            return ""
+        image_info_pages = query_pages(
+            {
+                "action": "query",
+                "titles": image_names[0],
+                "prop": "imageinfo",
+                "iiprop": "url",
+                "iiurlwidth": "720",
+                "format": "json",
+                "formatversion": "2",
+            }
+        )
+        for image_page in image_info_pages:
+            image_info = image_page.get("imageinfo", [])
+            if image_info:
+                return image_info[0].get("thumburl") or image_info[0].get("url", "")
+        return ""
+
+    def try_pages(pages: list[dict[str, Any]]) -> bool:
+        pages.sort(key=page_score, reverse=True)
+        for page in pages:
+            if page_score(page) < 50:
+                continue
+            source = poster_from_page(page)
+            if not source:
+                continue
+            if not download_image(source, cache_cover_path(item["id"])):
+                continue
+            metadata_path = cache_metadata_path(item["id"])
+            metadata = dict(item)
+            metadata.pop("path", None)
+            metadata.pop("cover", None)
+            metadata.pop("size", None)
+            metadata.pop("source", None)
+            metadata.pop("installed", None)
+            metadata["match_title"] = sanitize_text(page.get("title", ""))
+            metadata_path.write_text(
+                json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            return True
+        return False
+
+    exact_titles = [f"{title} (film)"]
+    if year:
+        exact_titles.insert(0, f"{title} ({year} film)")
+    exact_titles.append(title)
+    exact_pages = query_pages(
+        {
+            "action": "query",
+            "titles": "|".join(exact_titles),
+            "redirects": "1",
+            "prop": "pageimages|info",
+            "piprop": "thumbnail|name",
+            "pithumbsize": "720",
+            "inprop": "url",
+            "format": "json",
+            "formatversion": "2",
+        }
+    )
+    if try_pages(exact_pages):
+        return True
+
+    search_pages = query_pages(
+        {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": f'"{title}" {year} film'.strip(),
+            "gsrnamespace": "0",
+            "gsrlimit": "8",
+            "prop": "pageimages|info",
+            "piprop": "thumbnail|name",
+            "pithumbsize": "720",
+            "inprop": "url",
+            "format": "json",
+            "formatversion": "2",
+        }
+    )
+    if try_pages(search_pages):
+        return True
+
+    # IMDb's public suggestion feed is a useful no-key fallback for alternate
+    # release titles (for example, "The Code" is also "Thick as Thieves").
+    suggestion = re.sub(r"[^a-z0-9]+", "_", f"{title}_{year}".lower()).strip("_")
+    try:
+        response = request_json(
+            "https://v2.sg.media-imdb.com/suggestion/x/"
+            + urllib.parse.quote(suggestion)
+            + ".json",
+            timeout=10,
+        )
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return False
+    title_key = normalized(title)
+    best: tuple[int, dict[str, Any]] | None = None
+    for result in response.get("d", []):
+        candidate = sanitize_text(str(result.get("l", "")))
+        candidate_key = normalized(candidate)
+        score = 0
+        if candidate_key == title_key:
+            score += 120
+        elif title_key and (
+            candidate_key.startswith(title_key + " ")
+            or title_key.startswith(candidate_key + " ")
+        ):
+            score += 60
+        result_year = str(result.get("y", ""))
+        if year and result_year == year:
+            score += 80
+        image_url = str(result.get("i", {}).get("imageUrl", ""))
+        if not image_url:
+            continue
+        if best is None or score > best[0]:
+            best = (score, result)
+    if best is None or best[0] < 120:
+        return False
+    image_url = str(best[1].get("i", {}).get("imageUrl", ""))
+    if not download_image(image_url, cache_cover_path(item["id"]), timeout=12):
+        return False
+    metadata_path = cache_metadata_path(item["id"])
+    metadata = {
+        key: value
+        for key, value in item.items()
+        if key not in {"path", "cover", "size", "source", "installed"}
+    }
+    metadata["match_title"] = sanitize_text(str(best[1].get("l", "")))
+    metadata["match_id"] = sanitize_text(str(best[1].get("id", "")))
+    metadata_path.write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    return True
+
+
+def extract_embedded_cover(path: Path, destination: Path) -> bool:
+    return convert_image_to_png(path, destination)
+
+
+def refresh_music_art(item: dict[str, Any]) -> bool:
+    destination = cache_cover_path(item["id"])
+    path = Path(item["path"])
+    tags = ffprobe_tags(path)
+    if tags:
+        item["artist"] = tags.get("album_artist") or tags.get("artist") or item.get("artist", "")
+        item["title"] = tags.get("title") or item.get("title", "")
+        item["album"] = tags.get("album") or item.get("album", "")
+        metadata = {
+            key: value
+            for key, value in item.items()
+            if key not in {"path", "cover", "size", "source", "installed"}
+        }
+        metadata_path = cache_metadata_path(item["id"])
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        metadata_path.write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+    if extract_embedded_cover(path, destination):
+        return True
+
+    artist = item.get("artist", "")
+    title = item.get("title", "")
+    if not artist or artist == "Unknown Artist" or not title:
+        return False
+
+    # Apple's structured music catalog provides reliable, no-key album art
+    # for exact artist/title matches before falling back to MusicBrainz.
+    parameters = urllib.parse.urlencode(
+        {
+            "term": f"{artist} {title}",
+            "media": "music",
+            "entity": "song",
+            "limit": "20",
+            "country": "US",
+        }
+    )
+    try:
+        response = request_json(
+            f"https://itunes.apple.com/search?{parameters}", timeout=10
+        )
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        response = {}
+
+    def normalized(value: str) -> str:
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    artist_key = normalized(artist)
+    title_key = normalized(title)
+    best: tuple[int, dict[str, Any]] | None = None
+    for result in response.get("results", []):
+        result_artist = normalized(str(result.get("artistName", "")))
+        result_title = normalized(str(result.get("trackName", "")))
+        score = 0
+        if result_artist == artist_key:
+            score += 100
+        if result_title == title_key:
+            score += 120
+        artwork = str(result.get("artworkUrl100", ""))
+        if not artwork:
+            continue
+        if best is None or score > best[0]:
+            best = (score, result)
+    if best is not None and best[0] >= 200:
+        artwork = str(best[1].get("artworkUrl100", ""))
+        artwork = re.sub(r"/100x100bb\.", "/600x600bb.", artwork)
+        if download_image(artwork, destination, timeout=12):
+            return True
+
+    query = f'recording:"{title}" AND artist:"{artist}"'
+    parameters = urllib.parse.urlencode({"query": query, "fmt": "json", "limit": "5"})
+    # MusicBrainz asks unauthenticated clients to remain at roughly one
+    # request per second. Artwork refresh runs in one serialized worker.
+    time.sleep(1.05)
+    try:
+        response = request_json(
+            f"https://musicbrainz.org/ws/2/recording/?{parameters}", timeout=10
+        )
+    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+        return False
+    for recording in response.get("recordings", []):
+        for release in recording.get("releases", []):
+            group_id = release.get("release-group", {}).get("id")
+            if not group_id:
+                continue
+            url = f"https://coverartarchive.org/release-group/{group_id}/front-500"
+            if download_image(url, destination, timeout=12):
+                return True
+    return False
+
+
+def refresh_art(kind: str) -> int:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    lock = STATE_ROOT / f"{kind}.refresh.lock"
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        os.close(descriptor)
+    except FileExistsError:
+        try:
+            if time.time() - lock.stat().st_mtime < 300:
+                return 0
+        except OSError:
+            return 0
+        lock.unlink(missing_ok=True)
+        return refresh_art(kind)
+
+    try:
+        for item in catalog(kind):
+            if item.get("cover"):
+                continue
+            miss_marker = cache_dir(item["id"]) / "art-miss"
+            try:
+                if time.time() - miss_marker.stat().st_mtime < 7 * 24 * 60 * 60:
+                    continue
+            except OSError:
+                pass
+            try:
+                if kind == "movies":
+                    refreshed = refresh_movie_art(item)
+                else:
+                    refreshed = refresh_music_art(item)
+                if refreshed:
+                    miss_marker.unlink(missing_ok=True)
+                else:
+                    miss_marker.parent.mkdir(parents=True, exist_ok=True)
+                    miss_marker.touch()
+            except Exception:
+                miss_marker.parent.mkdir(parents=True, exist_ok=True)
+                miss_marker.touch()
+                continue
+    finally:
+        lock.unlink(missing_ok=True)
+    return 0
+
+
+def refresh_one_cover(kind: str, source_text: str) -> int:
+    source = Path(source_text).resolve()
+    if not source.is_file() or not is_supported(kind, source):
+        return 2
+    item = load_or_create_metadata(kind, source)
+    item.update(
+        {
+            "path": str(source),
+            "cover": "",
+            "size": source.stat().st_size,
+            "source": "removable",
+            "installed": False,
+        }
+    )
+    destination = cache_cover_path(item["id"])
+    if destination.is_file():
+        print(destination)
+        return 0
+    refreshed = (
+        refresh_movie_art(item) if kind == "movies" else refresh_music_art(item)
+    )
+    if refreshed and destination.is_file():
+        (cache_dir(item["id"]) / "art-miss").unlink(missing_ok=True)
+        print(destination)
+        return 0
+    return 1
+
+
+def launch_refresh(kind: str, items: list[dict[str, Any]]) -> None:
+    if all(item.get("cover") for item in items):
+        return
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(Path(__file__).resolve()), "refresh", kind],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        pass
+
+
+def copy_with_progress(source: Path, destination: Path) -> None:
+    STATE_ROOT.mkdir(parents=True, exist_ok=True)
+    total = max(source.stat().st_size, 1)
+    copied = 0
+    temporary = destination.with_name(destination.name + ".part")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE.write_text("0\tCOPYING\n", encoding="utf-8")
+    try:
+        with source.open("rb") as input_file, temporary.open("wb") as output_file:
+            while True:
+                block = input_file.read(4 * 1024 * 1024)
+                if not block:
+                    break
+                output_file.write(block)
+                copied += len(block)
+                percent = min(99, int(copied * 100 / total))
+                PROGRESS_FILE.write_text(
+                    f"{percent}\tCOPYING\n", encoding="utf-8"
+                )
+            output_file.flush()
+            os.fsync(output_file.fileno())
+        shutil.copystat(source, temporary, follow_symlinks=True)
+        os.replace(temporary, destination)
+        PROGRESS_FILE.write_text("100\tINSTALLED\n", encoding="utf-8")
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        PROGRESS_FILE.write_text("0\tFAILED\n", encoding="utf-8")
+        raise
+
+
+def copy_directory_with_progress(source: Path, destination: Path) -> None:
+    files = [path for path in source.rglob("*") if path.is_file()]
+    total = max(sum(path.stat().st_size for path in files), 1)
+    copied = 0
+    temporary = destination.with_name(destination.name + ".part")
+    if temporary.exists():
+        shutil.rmtree(temporary)
+    temporary.mkdir(parents=True, exist_ok=True)
+    PROGRESS_FILE.write_text("0\tCOPYING\n", encoding="utf-8")
+    try:
+        for source_file in files:
+            relative = source_file.relative_to(source)
+            destination_file = temporary / relative
+            destination_file.parent.mkdir(parents=True, exist_ok=True)
+            with source_file.open("rb") as input_file, destination_file.open(
+                "wb"
+            ) as output_file:
+                while True:
+                    block = input_file.read(4 * 1024 * 1024)
+                    if not block:
+                        break
+                    output_file.write(block)
+                    copied += len(block)
+                    percent = min(99, int(copied * 100 / total))
+                    PROGRESS_FILE.write_text(
+                        f"{percent}\tCOPYING\n", encoding="utf-8"
+                    )
+            shutil.copystat(source_file, destination_file, follow_symlinks=True)
+        if destination.exists():
+            shutil.rmtree(destination)
+        os.replace(temporary, destination)
+        PROGRESS_FILE.write_text("100\tINSTALLED\n", encoding="utf-8")
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        PROGRESS_FILE.write_text("0\tFAILED\n", encoding="utf-8")
+        raise
+
+
+def install_media(kind: str, source_text: str) -> dict[str, Any]:
+    source = Path(source_text).resolve()
+    roots = removable_roots()
+    if not source.exists() or not any(within(source, root) for root in roots):
+        raise ValueError("The selected media is not on removable storage.")
+    is_show = kind == "movies" and source.is_dir()
+    if source.is_dir() and not is_show:
+        raise ValueError("Only TV show folders can be installed as a directory.")
+    if source.is_file() and not is_supported(kind, source):
+        raise ValueError("Unsupported media format.")
+
+    metadata = show_item(source, "removable") if is_show else load_or_create_metadata(kind, source)
+    if is_show:
+        destination_dir = MOVIE_ROOT / "Shows" / safe_name(source.name, "TV Show")
+        destination = destination_dir
+        copy_directory_with_progress(source, destination)
+    elif kind == "movies":
+        folder_name = metadata["title"]
+        if metadata.get("year"):
+            folder_name += f" ({metadata['year']})"
+        destination_dir = MOVIE_ROOT / safe_name(folder_name, "Movie")
+    else:
+        destination_dir = (
+            MUSIC_ROOT
+            / safe_name(metadata.get("artist", ""), "Unknown Artist")
+            / safe_name(metadata.get("album", ""), "Singles")
+        )
+    if not is_show:
+        destination = destination_dir / safe_name(source.name, "media" + source.suffix)
+        copy_with_progress(source, destination)
+
+    cover = cache_cover_path(metadata["id"])
+    local_cover = preferred_local_cover(source)
+    chosen_cover = local_cover if local_cover else cover if cover.is_file() else None
+    if chosen_cover:
+        convert_image_to_png(chosen_cover, destination_dir / "cover.png")
+    for directory in (destination_dir, destination_dir.parent):
+        try:
+            directory.chmod(0o2775)
+        except OSError:
+            pass
+    return {
+        "message": f"INSTALLED {metadata['title']}",
+        "path": str(destination),
+        "id": metadata["id"],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser("list")
+    list_parser.add_argument("kind", choices=("movies", "music"))
+    list_parser.add_argument("--no-refresh", action="store_true")
+
+    refresh_parser = subparsers.add_parser("refresh")
+    refresh_parser.add_argument("kind", choices=("movies", "music"))
+
+    cover_parser = subparsers.add_parser("cover")
+    cover_parser.add_argument("kind", choices=("movies", "music"))
+    cover_parser.add_argument("path")
+
+    install_parser = subparsers.add_parser("install")
+    install_parser.add_argument("kind", choices=("movies", "music"))
+    install_parser.add_argument("path")
+
+    args = parser.parse_args()
+    if args.command == "list":
+        items = catalog(args.kind)
+        print(json.dumps(items, ensure_ascii=False))
+        if not args.no_refresh:
+            launch_refresh(args.kind, items)
+        return 0
+    if args.command == "refresh":
+        return refresh_art(args.kind)
+    if args.command == "cover":
+        return refresh_one_cover(args.kind, args.path)
+    if args.command == "install":
+        try:
+            result = install_media(args.kind, args.path)
+        except (OSError, ValueError) as error:
+            print(str(error), file=sys.stderr)
+            return 2
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

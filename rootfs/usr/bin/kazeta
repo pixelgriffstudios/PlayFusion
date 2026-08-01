@@ -1,0 +1,442 @@
+#! /bin/bash
+
+# Save the PID of this script, which represents the game session
+#echo $$ > /tmp/kazeta_game.pid
+
+set -x
+
+# Gamescope requires a real DRM/Vulkan-capable GPU. QEMU on a Windows host
+# cannot provide the same graphics path as the target PC, so use Mesa's
+# software renderer only when a virtual machine is detected. Real hardware
+# continues to use the normal Gamescope launch path.
+function launch_bios {
+	if systemd-detect-virt --quiet; then
+		echo "DEBUG: Virtual machine detected; launching BIOS with software rendering."
+		WGPU_BACKEND=gl LIBGL_ALWAYS_SOFTWARE=1 kazeta-bios
+	else
+		gamescope --filter pixel -- kazeta-bios
+	fi
+}
+
+# Check for the --bios flag
+if [ "$1" == "--bios" ]; then
+	# If the flag is present, launch the BIOS immediately and exit,
+	# ignoring any inserted SD cards.
+	launch_bios
+	exit 0
+fi
+
+# check for autoboot disabled
+BIOS_CONFIG_FILE="$HOME/.local/share/kazeta-plus/config.toml"
+
+if [ -z "$1" ] && [ -f "$BIOS_CONFIG_FILE" ]; then
+	# Check if autoboot is set to false.
+	# We use a regex to ignore whitespace around the = sign.
+	if grep -q "^\s*autoboot\s*=\s*false\s*$" "$BIOS_CONFIG_FILE"; then
+		echo "DEBUG: Autoboot disabled in $BIOS_CONFIG_FILE. Booting to BIOS."
+		launch_bios
+		exit 0
+	fi
+fi
+
+BASE_DIR="$HOME/.local/share/kazeta"
+if [[ ! -d "${BASE_DIR}" ]]; then
+	mkdir -p "${BASE_DIR}"
+fi
+PROFILE_ID="default"
+if [[ -r "${BASE_DIR}/active-profile" ]]; then
+	candidate_profile="$(tr -d '\r\n' < "${BASE_DIR}/active-profile")"
+	case "${candidate_profile}" in
+		default|profile-1|profile-2|profile-3)
+			PROFILE_ID="${candidate_profile}"
+			;;
+	esac
+fi
+if [[ "${PROFILE_ID}" == "default" ]]; then
+	PROFILE_SAVE_ROOT="${BASE_DIR}/saves/default"
+else
+	PROFILE_SAVE_ROOT="${BASE_DIR}/saves/profiles/${PROFILE_ID}"
+fi
+export PLAYFUSION_PROFILE="${PROFILE_ID}"
+
+BASE_EXT="/media"
+result=$(ls -1 /media | wc -l)
+if [[ "$result" == "0" ]]; then
+	BASE_EXT="/run/media/${USER}"
+	if [[ ! -d "${BASE_EXT}" ]]; then
+		BASE_EXT="/run/media"
+	fi
+fi
+
+function get_attribute {
+	attribute=$1
+	shift
+	info_file="$@"
+	cat "${info_file}" | grep "^${attribute}=" | head -1 | cut -d= -f2-
+}
+
+function start_playtime_capture {
+	while true; do
+		sleep 60
+		date --iso-8601=seconds > .kazeta/var/playtime_end
+	done
+}
+
+# Check if a specific .kzi file was passed as an argument (in the BIOS)
+if [ -n "$1" ] && [ -f "$1" ]; then
+	filename=$(basename -- "$1")
+	extension="${filename##*.}"
+
+	if [[ "$extension" == "kzp" ]]; then
+		echo "DEBUG: Specific .kzp package passed: $1"
+		cart_pkg="$1"
+		# We intentionally leave cart_info empty here;
+		# it will be filled after the package is mounted.
+	else
+		echo "DEBUG: Specific .kzi metadata passed: $1"
+		cart_info="$1"
+	fi
+else
+	for i in $(seq 1 20); do # If not, wait up to 2 seconds for any cart
+		# First, try to find a "default" cart.
+		# We use -exec grep -l ... {} + which is efficient.
+		# It finds all *.kzi, greps them, and lists files that match.
+		# We pipe to head -1 to just get the first match (in case multiple are set).
+		# We also add 2>/dev/null to hide "Permission denied" errors.
+		cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" -exec grep -l "^SetAsDefaultGame=true$" {} + 2>/dev/null | head -1)
+
+		if [ -f "$cart_info" ]; then
+			echo "DEBUG: Found default cart: $cart_info" # Found a default cart. Break the loop.
+			break
+		fi
+
+		cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" 2>/dev/null | head -1) # If no default cart was found, try to find *any* cart (original behavior)
+		cart_pkg=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzp" 2>/dev/null | head -1) # if no .kzi, find a .kzp
+
+		if [[ -f "${cart_info}" ]] || [[ -f "${cart_pkg}" ]]; then
+			echo "DEBUG: Found first available cart." # Found *a* cart (just not a default). Break the loop.
+			break
+		else
+			sleep 0.1 # No .kzi files found at all. Sleep and try again.
+		fi
+	done
+fi
+
+if [[ ! -f "${cart_info}" ]] && [[ ! -f "${cart_pkg}" ]]; then
+	echo "DEBUG: No valid cart_info, launching BIOS." # no cart found, start bios/memory management app
+	launch_bios
+	exit 0
+fi
+
+if [[ -f "${cart_pkg}" ]]; then
+	cart_path="${BASE_DIR}/run/pkg"
+	mkdir -p "${cart_path}"
+	sudo kazeta-mount kzp "${cart_pkg}" "${cart_path}"
+	cart_info=$(find "${cart_path}" -maxdepth 2 -name "*.kzi" | head -1)
+	media_path=$(dirname "${cart_pkg}")
+else
+	cart_path=$(dirname "${cart_info}")
+	media_path="${cart_path}"
+fi
+cart_id="$(get_attribute 'Id' ${cart_info})"
+cart_icon="${cart_path}/$(get_attribute 'Icon' ${cart_info})"
+cart_cover_name="$(get_attribute 'Cover' "${cart_info}" 2>/dev/null || true)"
+cart_cover=""
+if [[ -n "${cart_cover_name}" ]]; then
+	cart_cover="${cart_path}/${cart_cover_name}"
+fi
+
+mkdir -p "${BASE_DIR}/cache/${cart_id}"
+cp "${cart_info}" "${BASE_DIR}/cache/${cart_id}/metadata.kzi"
+if [[ -f "${cart_icon}" ]]; then
+	cp "${cart_icon}" "${BASE_DIR}/cache/${cart_id}/icon.png"
+fi
+if [[ -n "${cart_cover}" && -f "${cart_cover}" ]]; then
+	cover_cache_name="$(basename "${cart_cover_name}")"
+	cp "${cart_cover}" "${BASE_DIR}/cache/${cart_id}/${cover_cache_name}"
+fi
+
+lower="${cart_path}"
+upper="${PROFILE_SAVE_ROOT}/${cart_id}"
+work="${BASE_DIR}/run/work"
+target="${BASE_DIR}/run/cart"
+
+if [[ ! -d "${upper}" ]]; then
+	rm -f "${upper}"
+	mkdir -p "${upper}"
+fi
+
+# --- Helper function to find a runtime in a given directory ---
+# Usage: runtime_path=$(find_runtime "name_to_find" "/path/to/search")
+function find_runtime {
+	local rt_name="$1"
+	local base_dir="$2"
+	local found_path=""
+
+	# Path 1: Exact match (e.g., Runtime=windows-1.1.kzr)
+	if [ -f "${base_dir}/${rt_name}" ]; then
+		found_path="${base_dir}/${rt_name}"
+	# Path 2: Match with .kzr (e.g., Runtime=windows-1.1)
+	elif [ -f "${base_dir}/${rt_name}.kzr" ]; then
+		found_path="${base_dir}/${rt_name}.kzr"
+	# Path 3: Glob match (e.g., Runtime=windows-1.1 finds windows-1.1-v2.kzr)
+	else
+		# Use ls to find the first match and redirect stderr to /dev/null
+		local glob_match=$(ls -1 "${base_dir}/${rt_name}-"*.kzr 2>/dev/null | head -1)
+		if [ -f "$glob_match" ]; then
+			found_path="$glob_match"
+		fi
+	fi
+
+	echo "$found_path" # Return the found path (or empty string if not found)
+}
+
+# --- Define runtime paths ---
+SYSTEM_RUNTIME_DIR="/usr/share/kazeta/runtimes"
+MOUNTED_GAME_DIR="${cart_path}" # inside the .kzp or folder
+PHYSICAL_MEDIA_DIR="${media_path}" # the SD card or folder containing the .kzp
+DEFAULT_RUNTIME="${SYSTEM_RUNTIME_DIR}/none.kzr"
+
+runtime_name="$(get_attribute 'Runtime' ${cart_info})"
+runtime="" # Initialize as empty
+
+if [ -n "$runtime_name" ]; then
+	echo "DEBUG: Runtime requested: '$runtime_name'"
+
+	# --- 1. Check Internal Drive (/usr/share/kazeta/runtimes) (priority 1) ---
+	echo "DEBUG: Checking for runtime on internal drive..."
+	runtime=$(find_runtime "$runtime_name" "$SYSTEM_RUNTIME_DIR")
+
+	# --- 2. Check physical media (/run/media/<name-of-removable-media-label>) (fallback) ---
+	if [ -z "$runtime" ] && [ -n "$PHYSICAL_MEDIA_DIR" ]; then # -z checks if the string is empty (not found)
+		echo "DEBUG: Runtime not found internally. Checking media source ($PHYSICAL_MEDIA_DIR)..."
+		runtime=$(find_runtime "$runtime_name" "$PHYSICAL_MEDIA_DIR")
+	fi
+
+	# --- 3. Check game folder/mounted image (/run/pkg inside of .kzp) (fallback #2) ---
+	if [ -z "$runtime" ]; then
+		echo "DEBUG: Runtime not found on media. Checking inside game mount ($MOUNTED_GAME_DIR)..."
+		runtime=$(find_runtime "$runtime_name" "$MOUNTED_GAME_DIR")
+	fi
+
+	# --- 4. Set default (if still not found) ---
+	if [ -z "$runtime" ]; then
+		echo "WARNING: Runtime '$runtime_name' not found anywhere. Defaulting to 'none'."
+		runtime="$DEFAULT_RUNTIME"
+	else
+		echo "DEBUG: Runtime found: $runtime"
+	fi
+else
+	# No runtime specified, use 'none'
+	echo "DEBUG: No runtime specified. Defaulting to 'none'."
+	runtime="$DEFAULT_RUNTIME"
+fi
+
+# Final check in case 'none.kzr' is missing
+if [ ! -f "$runtime" ]; then
+	echo "CRITICAL: Runtime file '$runtime' not found! The system may fail to mount." # We still pass the path to kazeta-mount, which will then fail.
+fi
+
+echo "DEBUG: Using runtime: $runtime"
+
+# Apply an optional per-system controller layout after InputPlumber has
+# normalized the physical device as a virtual Xbox 360 controller.
+cart_exec_for_profile="$(get_attribute 'Exec' "${cart_info}")"
+sudo /usr/bin/playfusion-controller-setup \
+	apply-game "${runtime_name}" "${cart_exec_for_profile}" ||
+	echo "WARNING: Unable to apply the saved PlayFusion controller layout."
+
+# --- Mount the filesystem ---
+runtimedir="${BASE_DIR}/run/runtime"
+sudo kazeta-mount "${lower}" "${upper}" "${work}" "${target}" "${runtime}" "${runtimedir}"
+
+# --- TRAP SETUP (Clean up on exit) ---
+trap "\
+	if [ -n \"\$PLAYTIME_PID\" ]; then kill \"\$PLAYTIME_PID\" 2>/dev/null; fi; \
+	if [ -n \"\$ANTIMICROX_PID\" ]; then kill \"\$ANTIMICROX_PID\" 2>/dev/null; fi; \
+	if [ -n \"\$ANTIMICROX_PID\" ]; then /usr/bin/playfusion-osk-toggle --stop 2>/dev/null || true; fi; \
+	popd; \
+	sudo kazeta-mount --unmount "${target}" "${runtimedir}"; \
+	if [[ -n "${cart_pkg:-}" ]]; then sudo kazeta-mount kzp --unmount "${cart_path}"; fi; \
+	sudo rm -rf "${work}"; \
+	sudo rm -rf "${upper}/.kazeta/share"; \
+	rmdir --ignore-fail-on-non-empty "${upper}/.kazeta"; \
+" EXIT
+
+export HOME="${BASE_DIR}/run/cart"
+
+unset XDG_CONFIG_HOME
+unset XDG_CACHE_HOME
+unset XDG_DATA_HOME
+unset XDG_STATE_HOME
+pushd "${HOME}"
+
+# --- Optional keyboard/mouse controller mapping for PC games ---
+# This feature is opt-in and restricted to the Windows and native Linux
+# runtimes. Emulator runtimes keep their own native controller handling.
+ANTIMICROX_PID=""
+keyboard_mapping="$(get_attribute 'KeyboardMapping' "${cart_info}")"
+keyboard_profile="$(get_attribute 'KeyboardProfile' "${cart_info}")"
+saved_profile_dir="/var/kazeta/controller-profiles/${cart_id}"
+saved_profile="${saved_profile_dir}/controller.gamecontroller.amgp"
+
+case "${runtime_name,,}" in
+	windows*|linux*)
+		profile_path=""
+		if [[ -n "${keyboard_profile}" ]]; then
+			if [[ -f "${cart_path}/${keyboard_profile}" ]]; then
+				profile_path="${cart_path}/${keyboard_profile}"
+			elif [[ -f "${media_path}/${keyboard_profile}" ]]; then
+				profile_path="${media_path}/${keyboard_profile}"
+			elif [[ -f "${keyboard_profile}" ]]; then
+				profile_path="${keyboard_profile}"
+			fi
+		elif [[ -f "${saved_profile_dir}/enabled" && -f "${saved_profile}" ]]; then
+			profile_path="${saved_profile}"
+		fi
+
+		if [[ "${keyboard_mapping,,}" == "true" && -z "${profile_path}" && -f "${saved_profile}" ]]; then
+			profile_path="${saved_profile}"
+		fi
+
+		if [[ -n "${profile_path}" && -x /usr/lib/playfusion/antimicrox/AntiMicroX.AppImage ]]; then
+			echo "DEBUG: Starting PC keyboard controller profile: ${profile_path}"
+			mkdir -p "${HOME}/.kazeta/var"
+			/usr/lib/playfusion/antimicrox/AntiMicroX.AppImage \
+				--hidden \
+				--no-tray \
+				--eventgen uinput \
+				--profile "${profile_path}" \
+				> "${HOME}/.kazeta/var/antimicrox.log" 2>&1 &
+			ANTIMICROX_PID=$!
+			sleep 0.4
+		fi
+		;;
+esac
+
+# --- Apply the persistent Xbox profile to Wii games using Dolphin ---
+# WiiGamepad may be set to true or false in the KZI. When omitted, WBFS/WAD
+# content and Wii ISO headers are detected automatically. The helper edits the
+# active overlay, so an older saved RetroArch config cannot restore bad inputs.
+if [[ "${runtime_name,,}" == dolphin* ]]; then
+	wii_gamepad_mode="$(get_attribute 'WiiGamepad' "${cart_info}")"
+	/usr/bin/kazeta-apply-wii-gamepad-profile \
+		"${HOME}/.config/retroarch/retroarch.cfg" \
+		"${HOME}/game" \
+		"${wii_gamepad_mode:-auto}" || \
+		echo "WARNING: Unable to apply the Wii gamepad profile."
+fi
+
+# --- Handle InputPlumber Controller Profile ---
+cart_controller="$(get_attribute 'Controller' ${cart_info})"
+
+if [ -n "$cart_controller" ]; then
+	echo "DEBUG: Controller profile requested: $cart_controller"
+
+	controller_path=""
+
+	# 1. Look in the immediate game directory (where the .kzi is)
+	if [ -f "${cart_path}/${cart_controller}" ]; then
+		controller_path="${cart_path}/${cart_controller}"
+	# 2. Look in the root of the physical media (useful if kzi is in a subfolder but yaml is at root)
+	elif [ -f "${media_path}/${cart_controller}" ]; then
+		controller_path="${media_path}/${cart_controller}"
+	# 3. Check if user provided a full absolute path
+	elif [ -f "${cart_controller}" ]; then
+		controller_path="${cart_controller}"
+	fi
+
+	if [ -n "$controller_path" ]; then
+		echo "DEBUG: Loading InputPlumber profile: $controller_path"
+		busctl call org.shadowblip.InputPlumber \
+			/org/shadowblip/InputPlumber/CompositeDevice0 \
+			org.shadowblip.Input.CompositeDevice \
+			LoadProfilePath "s" "$controller_path"
+	else
+		echo "WARNING: Controller profile '$cart_controller' not found in cart or media path."
+	fi
+fi
+
+cart_exec="$(get_attribute 'Exec' ${cart_info})"
+cart_gsopts="$(get_attribute 'GamescopeOptions' ${cart_info})"
+if [[ -z "${cart_gsopts}" && "${runtime_name,,}" == cemu* ]]; then
+	cart_gsopts="-w 1280 -h 720 -W 1920 -H 1080 -r 60 --force-windows-fullscreen -F fsr --sharpness 2"
+fi
+echo "$cart_exec" > /tmp/kazeta-cart-exec
+
+# append previously captured playtime to the log
+if [ -f .kazeta/var/playtime_start ] && [ -f .kazeta/var/playtime_end ]; then
+	echo "$(cat .kazeta/var/playtime_start) $(cat .kazeta/var/playtime_end)" >> .kazeta/var/playtime.log
+fi
+rm -f .kazeta/var/playtime_start
+rm -f .kazeta/var/playtime_end
+
+mkdir -p .kazeta/var
+date --iso-8601=seconds > .kazeta/var/playtime_start
+start_playtime_capture &
+PLAYTIME_PID=$! # save PID of background job
+
+# --- EXECUTION & ERROR HANDLING ---
+
+# 1. Start Timer
+START_TIME=$(date +%s)
+
+# 2. Run Gamescope
+# We capture the output to the log file inside the mount
+gamescope ${cart_gsopts} -- ./.kazeta/share/run /tmp/kazeta-cart-exec | grep -v "pressure-vessel-wrap" > "${HOME}/.kazeta/var/run.log" 2>&1
+EXIT_CODE=$?
+
+set +x # disable debug tracing
+
+# 3. Stop Timer
+END_TIME=$(date +%s)
+DURATION=$((END_TIME - START_TIME))
+
+# 4. Define Threshold (Seconds)
+# If the game runs for less than this, we consider it a "Failure to Launch"
+CRASH_THRESHOLD=10
+
+# Check: Did it fail? AND Did it fail quickly?
+if [ $EXIT_CODE -ne 0 ] && [ $DURATION -lt $CRASH_THRESHOLD ]; then
+	# ===============================
+	#      ERROR SCREEN LOGIC
+	# ===============================
+
+	# Stop background jobs using the captured PID
+	if [ -n "$PLAYTIME_PID" ]; then
+		kill "$PLAYTIME_PID" 2>/dev/null
+	fi
+
+	PHYSICAL_LOG_PATH="${PROFILE_SAVE_ROOT}/${cart_id}/.kazeta/var/run.log"
+
+	echo "" >> /var/kazeta/session.log
+	echo "========== [KAZETA+] GAME LAUNCH FAILURE ==========" >> /var/kazeta/session.log
+	echo "Timestamp: $(date)" >> /var/kazeta/session.log
+	echo "Cart ID: ${cart_id}" >> /var/kazeta/session.log
+	echo "Duration: ${DURATION} seconds (Threshold: ${CRASH_THRESHOLD}s)" >> /var/kazeta/session.log
+	echo "Exit Code: ${EXIT_CODE}" >> /var/kazeta/session.log
+	echo "Log Path: ${PHYSICAL_LOG_PATH}" >> /var/kazeta/session.log
+	echo "Last 20 lines of game execution log:" >> /var/kazeta/session.log
+
+	# Check if game log exists AND has content
+	if [ -f "${PHYSICAL_LOG_PATH}" ]; then
+		if [ -s "${PHYSICAL_LOG_PATH}" ]; then
+			# File exists and is NOT empty
+			tail -n 20 "${PHYSICAL_LOG_PATH}" >> /var/kazeta/session.log
+		else
+			# File exists but IS empty (0 bytes)
+			echo "---------------------------------------------------" >> /var/kazeta/session.log
+			echo "[!] run.log is empty." >> /var/kazeta/session.log
+			echo "The application exited immediately without producing output." >> /var/kazeta/session.log
+		fi
+	else
+		echo "No run.log found at ${PHYSICAL_LOG_PATH}" >> /var/kazeta/session.log
+	fi
+	echo "===================================================" >> /var/kazeta/session.log
+
+	# Call the helper script as root
+	sudo /usr/bin/kazeta-show-error
+fi
+
+# If the game ran successfully (or ran longer than 10s), we just fall through
+# to the 'trap' which handles unmounting and cleanup automatically.

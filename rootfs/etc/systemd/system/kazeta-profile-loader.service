@@ -1,0 +1,16 @@
+[Unit]
+Description=Load custom InputPlumber profile for Kazeta+
+Requires=inputplumber.service user@1000.service
+After=inputplumber.service user@1000.service
+
+[Service]
+Type=oneshot
+ExecStartPre=/bin/sleep 2
+# We use /bin/sh to run a conditional check.
+# "busctl introspect" checks if the object path exists.
+# If it does (&&), we run the LoadProfilePath command.
+# If it doesn't (||), we echo a warning but exit with 0 (success) so the service doesn't fail.
+ExecStart=/bin/sh -c 'if busctl introspect org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/CompositeDevice0 >/dev/null 2>&1; then /usr/bin/busctl call org.shadowblip.InputPlumber /org/shadowblip/InputPlumber/CompositeDevice0 org.shadowblip.Input.CompositeDevice LoadProfilePath "s" /usr/share/inputplumber/profiles/steam-deck.yaml; else echo "Kazeta Profile Loader: No CompositeDevice0 found, skipping."; exit 0; fi'
+
+[Install]
+WantedBy=multi-user.target

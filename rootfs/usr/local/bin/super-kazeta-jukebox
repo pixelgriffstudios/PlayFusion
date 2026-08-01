@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MUSIC_ROOT="${SUPER_KAZETA_MUSIC_ROOT:-/var/kazeta/music}"
+INPUT_CONFIG="/etc/super-kazeta/mpv-jukebox-input.conf"
+PROJECTM_TEMPLATE="/etc/super-kazeta/projectm-config.inp"
+LOG_FILE="/var/kazeta/state/jukebox.log"
+PROJECTM_LOG="/var/kazeta/state/jukebox-projectm.log"
+TARGET="${1:-$MUSIC_ROOT}"
+PLAY_MODE="${2:---shuffle}"
+PRESET_SECONDS="${3:-25}"
+VISUAL_MODE="${4:---fullscreen}"
+PROJECTM_BIN="/usr/bin/projectM-pulseaudio"
+BEZEL_BIN="/usr/local/bin/playfusion-jukebox-bezel"
+BEZEL_IMAGE="/usr/share/playfusion/playfusion-jukebox-cabinet.png"
+PROJECTM_CONFIG="$HOME/.projectM/config.inp"
+SYSTEM_PRESET_ROOT="/usr/share/projectM/presets"
+FLAT_PRESET_ROOT="$HOME/.local/share/playfusion/projectm-presets"
+
+case "$PRESET_SECONDS" in
+    5|10|15|20|25) ;;
+    *) PRESET_SECONDS=25 ;;
+esac
+case "$VISUAL_MODE" in
+    --cabinet|--fullscreen) ;;
+    *) VISUAL_MODE=--fullscreen ;;
+esac
+
+ROOT_WIDTH=1920
+ROOT_HEIGHT=1080
+JUKEBOX_X=448
+JUKEBOX_Y=218
+JUKEBOX_WIDTH=1021
+JUKEBOX_HEIGHT=573
+
+prepare_cabinet_geometry() {
+    local geometry
+    geometry=$(
+        xrandr --current 2>/dev/null |
+            awk '/\*/ {print $1; exit}'
+    )
+    if [[ "$geometry" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+        ROOT_WIDTH=${BASH_REMATCH[1]}
+        ROOT_HEIGHT=${BASH_REMATCH[2]}
+    fi
+    JUKEBOX_X=$((ROOT_WIDTH * 233 / 1000))
+    JUKEBOX_Y=$((ROOT_HEIGHT * 202 / 1000))
+    JUKEBOX_WIDTH=$((ROOT_WIDTH * 532 / 1000))
+    JUKEBOX_HEIGHT=$((ROOT_HEIGHT * 531 / 1000))
+}
+
+if [[ -f "$TARGET" ]]; then
+    TRACKS=("$TARGET")
+else
+    mapfile -d '' TRACKS < <(
+        find "$TARGET" -type f \
+            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' \
+               -o -iname '*.opus' -o -iname '*.m4a' -o -iname '*.wav' \) \
+            -print0 | sort -z
+    )
+fi
+
+if [[ ${#TRACKS[@]} -eq 0 ]]; then
+    echo "No supported music files found in $TARGET" >&2
+    exit 2
+fi
+
+ORDER_OPTIONS=()
+if [[ "$PLAY_MODE" == "--shuffle" && ${#TRACKS[@]} -gt 1 ]]; then
+    ORDER_OPTIONS+=(--shuffle)
+fi
+
+prepare_projectm() {
+    mkdir -p "$(dirname "$PROJECTM_CONFIG")" "$FLAT_PRESET_ROOT"
+
+    if [[ ! -s "$PROJECTM_CONFIG" ]]; then
+        cp "$PROJECTM_TEMPLATE" "$PROJECTM_CONFIG"
+    fi
+
+    local source_count cached_count marker
+    marker="$FLAT_PRESET_ROOT/.preset-count"
+    source_count=$(
+        find "$SYSTEM_PRESET_ROOT" -type f \
+            \( -iname '*.milk' -o -iname '*.prjm' \) | wc -l
+    )
+    cached_count=$(cat "$marker" 2>/dev/null || printf '0')
+
+    if [[ "$source_count" -gt 0 && "$cached_count" != "$source_count" ]]; then
+        find "$FLAT_PRESET_ROOT" -mindepth 1 -maxdepth 1 -type l -delete
+        local index=0 preset basename link_name
+        while IFS= read -r -d '' preset; do
+            basename=${preset##*/}
+            printf -v link_name '%05d-%s' "$index" "$basename"
+            ln -s "$preset" "$FLAT_PRESET_ROOT/$link_name"
+            index=$((index + 1))
+        done < <(
+            find "$SYSTEM_PRESET_ROOT" -type f \
+                \( -iname '*.milk' -o -iname '*.prjm' \) -print0 | sort -z
+        )
+        printf '%s\n' "$source_count" > "$marker"
+    fi
+
+    local fullscreen=true window_width="$ROOT_WIDTH" window_height="$ROOT_HEIGHT"
+    if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
+        fullscreen=false
+        window_width="$JUKEBOX_WIDTH"
+        window_height="$JUKEBOX_HEIGHT"
+    fi
+
+    sed -i -E \
+        -e "s|^Preset Path[[:space:]]*=.*|Preset Path = $FLAT_PRESET_ROOT|" \
+        -e "s/^Preset Duration[[:space:]]*=.*/Preset Duration = $PRESET_SECONDS/" \
+        -e "s/^Fullscreen[[:space:]]*=.*/Fullscreen = $fullscreen/" \
+        -e "s/^Window Width[[:space:]]*=.*/Window Width = $window_width/" \
+        -e "s/^Window Height[[:space:]]*=.*/Window Height = $window_height/" \
+        "$PROJECTM_CONFIG"
+}
+
+MPV_PID=""
+PROJECTM_PID=""
+BEAT_PID=""
+BEZEL_PID=""
+OFFSCREEN_PID=""
+OFFSCREEN_BIN="/usr/local/bin/playfusion-projectm-offscreen"
+OFFSCREEN_FRAME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/playfusion-projectm.rgba"
+
+projectm_source_output() {
+    pactl list source-outputs 2>/dev/null |
+        awk -v wanted="$PROJECTM_PID" '
+            /^Source Output #[0-9]+/ {
+                current=$3
+                sub(/^#/, "", current)
+            }
+            index($0, "application.process.id = \"" wanted "\"") {
+                print current
+                exit
+            }
+        '
+}
+
+cleanup() {
+    if [[ -n "$OFFSCREEN_PID" ]]; then
+        kill -TERM "$OFFSCREEN_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BEZEL_PID" ]]; then
+        kill -TERM "$BEZEL_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$PROJECTM_PID" ]]; then
+        kill -TERM "$PROJECTM_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BEAT_PID" ]]; then
+        kill -TERM "$BEAT_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MPV_PID" ]]; then
+        kill -TERM "$MPV_PID" 2>/dev/null || true
+    fi
+    sleep 0.2
+    if [[ -n "$PROJECTM_PID" ]]; then
+        kill -KILL "$PROJECTM_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BEZEL_PID" ]]; then
+        kill -KILL "$BEZEL_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$BEAT_PID" ]]; then
+        kill -KILL "$BEAT_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$MPV_PID" ]]; then
+        kill -KILL "$MPV_PID" 2>/dev/null || true
+    fi
+    if [[ -n "$OFFSCREEN_PID" ]]; then
+        kill -KILL "$OFFSCREEN_PID" 2>/dev/null || true
+    fi
+    rm -f "$OFFSCREEN_FRAME" "$OFFSCREEN_FRAME.tmp"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$(dirname "$LOG_FILE")"
+
+/usr/bin/mpv \
+    --no-config \
+    --no-video \
+    --force-window=no \
+    --input-gamepad=yes \
+    --input-conf="$INPUT_CONFIG" \
+    "${ORDER_OPTIONS[@]}" \
+    --loop-playlist=inf \
+    --osd-level=1 \
+    --log-file="$LOG_FILE" \
+    "${TRACKS[@]}" &
+MPV_PID=$!
+
+sleep 0.5
+
+# Both display modes listen to the monitor belonging to the active HDMI/DP
+# output. Cabinet mode publishes compact level data for PlayFusion's native
+# embedded visualizer; fullscreen mode keeps the full projectM preset library.
+DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null || true)
+MONITOR_SOURCE="${DEFAULT_SINK:+${DEFAULT_SINK}.monitor}"
+if ! pactl list short sources 2>/dev/null |
+    awk -v wanted="$MONITOR_SOURCE" '$2 == wanted { found=1 } END { exit !found }'; then
+    MONITOR_SOURCE=""
+fi
+
+if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
+    prepare_cabinet_geometry
+    prepare_projectm
+    rm -f "$OFFSCREEN_FRAME" "$OFFSCREEN_FRAME.tmp"
+    # Cabinet projectM now renders natively inside kazeta-bios. This launcher
+    # only owns audio playback so no external window or frame copy is needed.
+    wait "$MPV_PID" || true
+    exit 0
+fi
+
+if [[ -x "$PROJECTM_BIN" ]]; then
+    prepare_cabinet_geometry
+    prepare_projectm
+    if [[ -n "$MONITOR_SOURCE" ]]; then
+        PULSE_SOURCE="$MONITOR_SOURCE" "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
+    else
+        "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
+    fi
+    PROJECTM_PID=$!
+
+    # projectM 3.1's PulseAudio frontend ignores PULSE_SOURCE and frequently
+    # opens the analog monitor. Move its recording stream to the HDMI/DP
+    # monitor after PipeWire creates it.
+    if [[ -n "$MONITOR_SOURCE" ]]; then
+        PROJECTM_SOURCE_OUTPUT=""
+        for _attempt in $(seq 1 50); do
+            PROJECTM_SOURCE_OUTPUT=$(projectm_source_output)
+            [[ -n "$PROJECTM_SOURCE_OUTPUT" ]] && break
+            sleep 0.1
+        done
+        if [[ -n "$PROJECTM_SOURCE_OUTPUT" ]]; then
+            pactl move-source-output "$PROJECTM_SOURCE_OUTPUT" \
+                "$MONITOR_SOURCE" 2>/dev/null || true
+            printf 'Moved projectM source-output %s to %s\n' \
+                "$PROJECTM_SOURCE_OUTPUT" "$MONITOR_SOURCE" >>"$PROJECTM_LOG"
+        fi
+    fi
+
+    if [[ "$VISUAL_MODE" == "--cabinet" ]] &&
+        command -v xdotool >/dev/null 2>&1 &&
+        [[ -x /usr/local/bin/playfusion-xembed ]]; then
+        export DISPLAY=${DISPLAY:-:0}
+        PROJECTM_WINDOW=""
+        PLAYFUSION_WINDOW=""
+        for _attempt in $(seq 1 80); do
+            PROJECTM_WINDOW=$(
+                xdotool search --onlyvisible --pid "$PROJECTM_PID" \
+                    --name '^projectM$' 2>/dev/null | head -n 1 || true
+            )
+            PLAYFUSION_WINDOW=$(
+                xdotool search --onlyvisible --name '^PlayFusion$' 2>/dev/null |
+                    head -n 1 || true
+            )
+            if [[ -n "$PROJECTM_WINDOW" && -n "$PLAYFUSION_WINDOW" ]]; then
+                break
+            fi
+            sleep 0.1
+        done
+        if [[ -n "$PROJECTM_WINDOW" && -n "$PLAYFUSION_WINDOW" ]]; then
+            /usr/local/bin/playfusion-xembed \
+                "$PROJECTM_WINDOW" "$PLAYFUSION_WINDOW" \
+                "$JUKEBOX_X" "$JUKEBOX_Y" "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT"
+            printf 'Embedded projectM window %s into PlayFusion %s at %sx%s+%s+%s\n' \
+                "$PROJECTM_WINDOW" "$PLAYFUSION_WINDOW" \
+                "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT" "$JUKEBOX_X" "$JUKEBOX_Y" \
+                >>"$LOG_FILE"
+
+            # A shaped, mouse-transparent sibling redraws the cabinet bezel
+            # above projectM while leaving the visualizer opening transparent.
+            if [[ -x "$BEZEL_BIN" && -s "$BEZEL_IMAGE" ]]; then
+                "$BEZEL_BIN" "$BEZEL_IMAGE" "$ROOT_WIDTH" "$ROOT_HEIGHT" \
+                    "$JUKEBOX_X" "$JUKEBOX_Y" "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT" \
+                    >>"$PROJECTM_LOG" 2>&1 &
+                BEZEL_PID=$!
+                BEZEL_WINDOW=""
+                for _attempt in $(seq 1 50); do
+                    BEZEL_WINDOW=$(
+                        xdotool search --onlyvisible --pid "$BEZEL_PID" \
+                            --name '^PlayFusion Jukebox Bezel$' 2>/dev/null |
+                            head -n 1 || true
+                    )
+                    [[ -n "$BEZEL_WINDOW" ]] && break
+                    sleep 0.1
+                done
+                if [[ -n "$BEZEL_WINDOW" ]]; then
+                    /usr/local/bin/playfusion-xembed \
+                        "$BEZEL_WINDOW" "$PLAYFUSION_WINDOW" \
+                        0 0 "$ROOT_WIDTH" "$ROOT_HEIGHT"
+                fi
+            fi
+        else
+            echo "Unable to locate projectM or PlayFusion X11 window" >>"$LOG_FILE"
+        fi
+    fi
+else
+    echo "projectM is not installed" >>"$LOG_FILE"
+    wait "$MPV_PID"
+    exit $?
+fi
+
+# Returning from either the music player or projectM returns to PlayFusion.
+wait -n "$MPV_PID" "$PROJECTM_PID" || true

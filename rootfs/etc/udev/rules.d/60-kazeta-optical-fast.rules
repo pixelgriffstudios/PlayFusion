@@ -1,0 +1,5 @@
+# PS1 Mode-2/2352 discs make systemd-udevd's generic blkid probe retry
+# incompatible 2048-byte reads for roughly 20 seconds. Kazeta identifies PS1
+# media directly from raw sectors and mounts other optical media explicitly, so
+# the generic optical blkid probe is unnecessary.
+KERNEL=="sr[0-9]*", ENV{UDEV_DISABLE_PERSISTENT_STORAGE_BLKID_FLAG}="1"

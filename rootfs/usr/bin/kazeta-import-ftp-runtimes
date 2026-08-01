@@ -1,0 +1,26 @@
+#!/bin/bash
+set -euo pipefail
+
+UPLOAD_DIR="/var/kazeta/runtime-uploads"
+TARGET_DIR="/usr/share/kazeta/runtimes"
+
+mkdir -p "$UPLOAD_DIR" "$TARGET_DIR"
+shopt -s nullglob
+for runtime in "$UPLOAD_DIR"/*.kzr; do
+    name=$(basename "$runtime")
+    [[ "$name" != .* ]] || continue
+    size=$(stat -c '%s' "$runtime")
+    [[ "$size" -ge 4096 ]] || continue
+    # Do not import a file while vsftpd is still writing it.
+    lsof -t -- "$runtime" >/dev/null 2>&1 && continue
+    file -Lb -- "$runtime" | grep -q '^EROFS filesystem' || {
+        echo "Ignoring non-EROFS runtime upload: $name" >&2
+        continue
+    }
+
+    temporary="$TARGET_DIR/.${name}.importing"
+    install -m 0644 "$runtime" "$temporary"
+    sync
+    mv -f "$temporary" "$TARGET_DIR/$name"
+    rm -f "$runtime"
+done

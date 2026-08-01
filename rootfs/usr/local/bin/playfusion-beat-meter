@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Publish lightweight music levels for PlayFusion's embedded Jukebox."""
+
+from __future__ import annotations
+
+import array
+import math
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+
+OUTPUT = Path(os.environ.get("PLAYFUSION_LEVEL_FILE", "/run/user/1000/playfusion-jukebox-levels"))
+
+
+def publish(rms: float, peak: float, bass: float) -> None:
+    temporary = OUTPUT.with_suffix(".tmp")
+    temporary.write_text(f"{rms:.4f} {peak:.4f} {bass:.4f}\n", encoding="ascii")
+    os.replace(temporary, OUTPUT)
+
+
+def main() -> int:
+    monitor = sys.argv[1] if len(sys.argv) > 1 else ""
+    command = [
+        "/usr/bin/parec",
+        "--raw",
+        "--format=s16le",
+        "--rate=48000",
+        "--channels=2",
+    ]
+    if monitor:
+        command.append(f"--device={monitor}")
+
+    OUTPUT.parent.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    smoothed_rms = 0.0
+    smoothed_peak = 0.0
+    smoothed_bass = 0.0
+    low_pass = 0.0
+    try:
+        assert process.stdout is not None
+        while True:
+            block = process.stdout.read(8192)
+            if not block:
+                break
+            samples = array.array("h")
+            samples.frombytes(block)
+            if sys.byteorder != "little":
+                samples.byteswap()
+            if len(samples) < 2:
+                continue
+
+            total = 0.0
+            bass_total = 0.0
+            peak = 0.0
+            frames = 0
+            for offset in range(0, len(samples) - 1, 2):
+                value = (samples[offset] + samples[offset + 1]) * 0.5 / 32768.0
+                low_pass += 0.055 * (value - low_pass)
+                total += value * value
+                bass_total += low_pass * low_pass
+                peak = max(peak, abs(value))
+                frames += 1
+            if not frames:
+                continue
+
+            rms = min(1.0, math.sqrt(total / frames) * 3.2)
+            bass = min(1.0, math.sqrt(bass_total / frames) * 4.8)
+            smoothed_rms = smoothed_rms * 0.68 + rms * 0.32
+            smoothed_peak = max(peak, smoothed_peak * 0.86)
+            smoothed_bass = smoothed_bass * 0.62 + bass * 0.38
+            publish(smoothed_rms, smoothed_peak, smoothed_bass)
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+        OUTPUT.unlink(missing_ok=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

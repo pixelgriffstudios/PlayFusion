@@ -1,0 +1,16 @@
+# PlayFusion projectM configuration
+Texture Size = 1024
+Mesh X = 128
+Mesh Y = 72
+FPS = 60
+Fullscreen = true
+Window Width = 1920
+Window Height = 1080
+Smooth Transition Duration = 4
+Preset Duration = 25
+Easter Egg Parameter = 1
+Hard Cut Sensitivity = 8
+Aspect Correction = true
+Preset Path = /usr/share/projectM/presets
+Title Font = Vera.ttf
+Menu Font = VeraMono.ttf

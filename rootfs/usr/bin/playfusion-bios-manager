@@ -1,0 +1,405 @@
+#!/bin/bash
+set -euo pipefail
+
+FIRMWARE_ROOT="${FIRMWARE_ROOT:-/var/kazeta/firmware}"
+MEDIA_ROOTS="${MEDIA_ROOTS:-}"
+
+usage() {
+    cat <<'EOF'
+Usage: playfusion-bios-manager status|scan
+
+status  Print tab-separated firmware inventory rows.
+scan    Find recognized firmware on mounted removable media and import it.
+
+For testing, FIRMWARE_ROOT and colon-separated MEDIA_ROOTS may be overridden.
+EOF
+}
+
+safe_find_any() {
+    local directory="$1"
+    shift
+    [[ -d "$directory" ]] || return 1
+    find "$directory" -maxdepth 1 -type f "$@" -print -quit 2>/dev/null |
+        grep -q .
+}
+
+status_row() {
+    printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4"
+}
+
+status_inventory() {
+    local ps2_count xbox_count ds_count dsi_count
+
+    if [[ -s "$FIRMWARE_ROOT/ps1/scph5501.bin" ]] ||
+        find /var/kazeta/internal-games -path '*/bios/scph5501.bin' \
+            -type f -print -quit 2>/dev/null | grep -q .; then
+        status_row "PLAYSTATION 1" "PRESENT" "REQUIRED" "scph5501.bin"
+    else
+        status_row "PLAYSTATION 1" "MISSING" "REQUIRED" "scph5501.bin"
+    fi
+
+    ps2_count=$(find "$FIRMWARE_ROOT/ps2" -maxdepth 1 -type f \
+        -iname 'scph*.bin' -size 4194304c 2>/dev/null | wc -l)
+    if (( ps2_count > 0 )); then
+        status_row "PLAYSTATION 2" "PRESENT" "REQUIRED" "SCPH BIOS (${ps2_count})"
+    else
+        status_row "PLAYSTATION 2" "MISSING" "REQUIRED" "scph#####.bin"
+    fi
+
+    if safe_find_any "$FIRMWARE_ROOT/segacd" \
+        \( -iname 'bios_CD_U.bin' -o -iname 'bios_CD_E.bin' -o -iname 'bios_CD_J.bin' \); then
+        status_row "SEGA CD" "PRESENT" "REQUIRED" "REGION BIOS"
+    else
+        status_row "SEGA CD" "MISSING" "REQUIRED" "bios_CD_U/E/J.bin"
+    fi
+
+    if safe_find_any "$FIRMWARE_ROOT/saturn" \
+        \( -iname 'sega_101.bin' -o -iname 'mpr-17933.bin' \); then
+        status_row "SEGA SATURN" "PRESENT" "REQUIRED" "SATURN BIOS"
+    else
+        status_row "SEGA SATURN" "MISSING" "REQUIRED" "sega_101.bin / mpr-17933.bin"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/pcengine/syscard3.pce" ]]; then
+        status_row "PC ENGINE CD" "PRESENT" "REQUIRED" "syscard3.pce"
+    else
+        status_row "PC ENGINE CD" "MISSING" "REQUIRED" "syscard3.pce"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/retroarch/lynxboot.img" ]]; then
+        status_row "ATARI LYNX" "PRESENT" "REQUIRED" "lynxboot.img"
+    else
+        status_row "ATARI LYNX" "MISSING" "REQUIRED" "lynxboot.img"
+    fi
+
+    ds_count=0
+    for file in bios7.bin bios9.bin firmware.bin; do
+        [[ -s "$FIRMWARE_ROOT/retroarch/$file" ]] && ((ds_count += 1)) || true
+    done
+    if (( ds_count == 3 )); then
+        status_row "NINTENDO DS" "PRESENT" "OPTIONAL" "bios7 + bios9 + firmware"
+    elif (( ds_count > 0 )); then
+        status_row "NINTENDO DS" "INCOMPLETE" "OPTIONAL" "${ds_count}/3 FILES"
+    else
+        status_row "NINTENDO DS" "OPTIONAL" "OPTIONAL" "NO BIOS NEEDED FOR MOST GAMES"
+    fi
+
+    dsi_count=0
+    for file in dsi_bios7.bin dsi_bios9.bin dsi_firmware.bin dsi_nand.bin; do
+        [[ -s "$FIRMWARE_ROOT/retroarch/$file" ]] && ((dsi_count += 1)) || true
+    done
+    if (( dsi_count == 4 )); then
+        status_row "NINTENDO DSI" "PRESENT" "REQUIRED" "4/4 DSI FILES"
+    elif (( dsi_count > 0 )); then
+        status_row "NINTENDO DSI" "INCOMPLETE" "REQUIRED" "${dsi_count}/4 FILES"
+    else
+        status_row "NINTENDO DSI" "MISSING" "REQUIRED" "BIOS7/9 + FIRMWARE + NAND"
+    fi
+
+    if safe_find_any "$FIRMWARE_ROOT/retroarch" \
+        \( -iname 'gb_bios.bin' -o -iname 'gbc_bios.bin' -o \
+           -iname 'gba_bios.bin' -o -iname 'sgb_bios.bin' \); then
+        status_row "GAME BOY FAMILY" "PRESENT" "OPTIONAL" "ONE OR MORE BIOS FILES"
+    else
+        status_row "GAME BOY FAMILY" "OPTIONAL" "OPTIONAL" "BUILT-IN EMULATION"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/retroarch/7800 BIOS (U).rom" ]]; then
+        status_row "ATARI 7800" "PRESENT" "OPTIONAL" "7800 BIOS (U).rom"
+    else
+        status_row "ATARI 7800" "OPTIONAL" "OPTIONAL" "BUILT-IN HIGH-LEVEL BIOS"
+    fi
+
+    if safe_find_any "$FIRMWARE_ROOT/retroarch" \
+        \( -iname 'kick*.rom' -o -iname 'kick*.bin' -o -iname 'kick*.a500' \); then
+        status_row "AMIGA" "PRESENT" "OPTIONAL" "KICKSTART ROM"
+    else
+        status_row "AMIGA" "OPTIONAL" "OPTIONAL" "AROS FALLBACK INCLUDED"
+    fi
+
+    xbox_count=0
+    [[ -s "$FIRMWARE_ROOT/xbox/mcpx_1.0.bin" ]] && ((xbox_count += 1)) || true
+    safe_find_any "$FIRMWARE_ROOT/xbox" \
+        \( -iname 'Complex_4627.bin' -o -iname 'Complex_4627v1.03.bin' \) &&
+        ((xbox_count += 1)) || true
+    [[ -s "$FIRMWARE_ROOT/xbox/xbox_hdd.qcow2" ]] && ((xbox_count += 1)) || true
+    if (( xbox_count == 3 )); then
+        status_row "ORIGINAL XBOX" "PRESENT" "REQUIRED" "3/3 XEMU FILES"
+    elif (( xbox_count > 0 )); then
+        status_row "ORIGINAL XBOX" "INCOMPLETE" "REQUIRED" "${xbox_count}/3 XEMU FILES"
+    else
+        status_row "ORIGINAL XBOX" "MISSING" "REQUIRED" "MCPX + BIOS + HDD"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/wiiu/keys.txt" ]]; then
+        status_row "WII U" "PRESENT" "AS NEEDED" "keys.txt"
+    else
+        status_row "WII U" "OPTIONAL" "AS NEEDED" "keys.txt FOR ENCRYPTED GAMES"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/retroarch/aes_keys.txt" ]]; then
+        status_row "NINTENDO 3DS" "PRESENT" "AS NEEDED" "aes_keys.txt"
+    else
+        status_row "NINTENDO 3DS" "OPTIONAL" "AS NEEDED" "AES KEYS FOR ENCRYPTED GAMES"
+    fi
+
+    if [[ -s "$FIRMWARE_ROOT/dreamcast/dc_boot.bin" ]]; then
+        status_row "DREAMCAST" "PRESENT" "OPTIONAL" "dc_boot.bin"
+    else
+        status_row "DREAMCAST" "OPTIONAL" "OPTIONAL" "HLE BIOS AVAILABLE"
+    fi
+
+    if safe_find_any "$FIRMWARE_ROOT/vita" \
+        \( -iname 'PSVUPDAT.PUP' -o -iname 'PSP2UPDAT.PUP' \); then
+        status_row "PLAYSTATION VITA" "MANUAL" "REQUIRED" "PACKAGE FOUND - INSTALL IN VITA3K"
+    else
+        status_row "PLAYSTATION VITA" "MANUAL" "REQUIRED" "OFFICIAL FIRMWARE + FONT PACKAGE"
+    fi
+}
+
+file_size() {
+    stat -c '%s' -- "$1" 2>/dev/null || printf '0\n'
+}
+
+valid_size() {
+    local file="$1"
+    shift
+    local size allowed
+    size=$(file_size "$file")
+    for allowed in "$@"; do
+        [[ "$size" == "$allowed" ]] && return 0
+    done
+    return 1
+}
+
+target_for_file() {
+    local file="$1"
+    local base lower
+    base=$(basename -- "$file")
+    lower=${base,,}
+
+    case "$lower" in
+        scph5501.bin)
+            valid_size "$file" 524288 || return 1
+            printf 'ps1/scph5501.bin\n'
+            ;;
+        scph*.bin)
+            [[ "$lower" =~ ^scph[0-9]{5}([._-].*)?\.bin$ ]] || return 1
+            valid_size "$file" 4194304 || return 1
+            printf 'ps2/%s\n' "$lower"
+            ;;
+        bios_cd_u.bin|bios_cd_e.bin|bios_cd_j.bin)
+            valid_size "$file" 131072 || return 1
+            case "$lower" in
+                bios_cd_u.bin) printf 'segacd/bios_CD_U.bin\n' ;;
+                bios_cd_e.bin) printf 'segacd/bios_CD_E.bin\n' ;;
+                bios_cd_j.bin) printf 'segacd/bios_CD_J.bin\n' ;;
+            esac
+            ;;
+        sega_101.bin|mpr-17933.bin)
+            valid_size "$file" 524288 || return 1
+            printf 'saturn/%s\n' "$lower"
+            ;;
+        syscard3.pce)
+            valid_size "$file" 262144 || return 1
+            printf 'pcengine/syscard3.pce\n'
+            ;;
+        lynxboot.img)
+            valid_size "$file" 512 || return 1
+            printf 'retroarch/lynxboot.img\n'
+            ;;
+        "7800 bios (u).rom")
+            valid_size "$file" 4096 || return 1
+            printf 'retroarch/7800 BIOS (U).rom\n'
+            ;;
+        bios7.bin)
+            valid_size "$file" 16384 || return 1
+            printf 'retroarch/bios7.bin\n'
+            ;;
+        bios9.bin)
+            valid_size "$file" 4096 || return 1
+            printf 'retroarch/bios9.bin\n'
+            ;;
+        firmware.bin)
+            valid_size "$file" 131072 262144 524288 || return 1
+            printf 'retroarch/firmware.bin\n'
+            ;;
+        dsi_bios7.bin)
+            valid_size "$file" 65536 || return 1
+            printf 'retroarch/dsi_bios7.bin\n'
+            ;;
+        dsi_bios9.bin)
+            valid_size "$file" 65536 || return 1
+            printf 'retroarch/dsi_bios9.bin\n'
+            ;;
+        dsi_firmware.bin)
+            valid_size "$file" 131072 || return 1
+            printf 'retroarch/dsi_firmware.bin\n'
+            ;;
+        dsi_nand.bin)
+            printf 'retroarch/dsi_nand.bin\n'
+            ;;
+        gb_bios.bin)
+            valid_size "$file" 256 || return 1
+            printf 'retroarch/gb_bios.bin\n'
+            ;;
+        gbc_bios.bin)
+            valid_size "$file" 2304 || return 1
+            printf 'retroarch/gbc_bios.bin\n'
+            ;;
+        gba_bios.bin)
+            valid_size "$file" 16384 || return 1
+            printf 'retroarch/gba_bios.bin\n'
+            ;;
+        sgb_bios.bin)
+            valid_size "$file" 256 || return 1
+            printf 'retroarch/sgb_bios.bin\n'
+            ;;
+        kick*.rom|kick*.bin|kick*.a500)
+            valid_size "$file" 262144 524288 1048576 || return 1
+            printf 'retroarch/%s\n' "$base"
+            ;;
+        aes_keys.txt)
+            [[ -s "$file" ]] || return 1
+            printf 'retroarch/aes_keys.txt\n'
+            ;;
+        mcpx_1.0.bin)
+            valid_size "$file" 512 || return 1
+            printf 'xbox/mcpx_1.0.bin\n'
+            ;;
+        complex_4627.bin)
+            valid_size "$file" 1048576 || return 1
+            printf 'xbox/Complex_4627.bin\n'
+            ;;
+        complex_4627v1.03.bin)
+            valid_size "$file" 1048576 || return 1
+            printf 'xbox/Complex_4627v1.03.bin\n'
+            ;;
+        xbox_hdd.qcow2)
+            [[ -s "$file" ]] || return 1
+            printf 'xbox/xbox_hdd.qcow2\n'
+            ;;
+        dc_boot.bin)
+            valid_size "$file" 2097152 || return 1
+            printf 'dreamcast/dc_boot.bin\n'
+            ;;
+        dc_flash.bin)
+            valid_size "$file" 131072 || return 1
+            printf 'dreamcast/dc_flash.bin\n'
+            ;;
+        psvupdat.pup|psp2updat.pup)
+            [[ -s "$file" ]] || return 1
+            printf 'vita/%s\n' "$base"
+            ;;
+        keys.txt)
+            # Generic keys.txt is accepted only when it resembles a Cemu key
+            # database, preventing unrelated text files from being imported.
+            grep -Eiq '^[[:space:]]*[0-9a-f]{32}[[:space:]]*(#.*)?$' "$file" ||
+                return 1
+            printf 'wiiu/keys.txt\n'
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+media_roots() {
+    local root
+    if [[ -n "$MEDIA_ROOTS" ]]; then
+        while IFS= read -r root; do
+            [[ -d "$root" ]] && printf '%s\n' "$root"
+        done < <(printf '%s\n' "$MEDIA_ROOTS" | tr ':' '\n')
+        return
+    fi
+
+    findmnt -rn -o TARGET 2>/dev/null |
+        while IFS= read -r root; do
+            case "$root" in
+                /run/media/*|/media/*|/mnt/*)
+                    [[ "$root" != /run/media/kazeta-optical* ]] || continue
+                    [[ ! -e "$root/.playfusion-storage" ]] || continue
+                    printf '%s\n' "$root"
+                    ;;
+            esac
+        done
+}
+
+import_one() {
+    local source="$1"
+    local relative="$2"
+    local destination="$FIRMWARE_ROOT/$relative"
+    local temp owner
+
+    mkdir -p -- "$(dirname -- "$destination")"
+    if [[ -e "$destination" ]]; then
+        if cmp -s -- "$source" "$destination"; then
+            printf 'UNCHANGED\t%s\t%s\n' "$(basename -- "$source")" "$relative"
+            return 2
+        fi
+        printf 'CONFLICT\t%s\t%s\n' "$(basename -- "$source")" "$relative"
+        return 3
+    fi
+
+    temp="${destination}.import.$$"
+    install -m 0644 -- "$source" "$temp"
+    mv -f -- "$temp" "$destination"
+    if (( EUID == 0 )); then
+        if getent passwd kazetaftp >/dev/null 2>&1; then
+            owner=kazetaftp:kazetaftp
+        else
+            owner=root:root
+        fi
+        chown "$owner" "$destination"
+    fi
+    printf 'IMPORTED\t%s\t%s\n' "$(basename -- "$source")" "$relative"
+}
+
+scan_media() {
+    local roots=() root file target
+    local imported=0 unchanged=0 conflicts=0 recognized=0
+
+    while IFS= read -r root; do
+        roots+=("$root")
+    done < <(media_roots | sort -u)
+
+    if (( ${#roots[@]} == 0 )); then
+        echo "ERROR	NO MOUNTED USB OR REMOVABLE MEDIA FOUND"
+        return 1
+    fi
+
+    for root in "${roots[@]}"; do
+        while IFS= read -r -d '' file; do
+            target=$(target_for_file "$file" 2>/dev/null) || continue
+            ((recognized += 1)) || true
+            if import_one "$file" "$target"; then
+                ((imported += 1)) || true
+            else
+                case $? in
+                    2) ((unchanged += 1)) || true ;;
+                    3) ((conflicts += 1)) || true ;;
+                esac
+            fi
+        done < <(find "$root" -maxdepth 6 -type f -print0 2>/dev/null)
+    done
+
+    printf 'SUMMARY\tIMPORTED=%d\tUNCHANGED=%d\tCONFLICTS=%d\tRECOGNIZED=%d\n' \
+        "$imported" "$unchanged" "$conflicts" "$recognized"
+    (( recognized > 0 ))
+}
+
+case "${1:-}" in
+    status)
+        status_inventory
+        ;;
+    scan)
+        scan_media
+        ;;
+    -h|--help|help|"")
+        usage
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

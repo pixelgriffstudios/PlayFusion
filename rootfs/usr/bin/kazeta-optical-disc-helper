@@ -1,0 +1,1172 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+STATE_DIR=/run/kazeta/optical
+VISIBLE_CART=/run/media/kazeta-optical
+CACHE_ROOT=/var/kazeta/optical-cache
+FIRMWARE_ROOT=/var/kazeta/firmware
+RUNTIME_ROOT=/usr/share/kazeta/runtimes
+ICON_ROOT=/usr/share/kazeta/optical-icons
+UNKNOWN_ICON="$ICON_ROOT/unknown.png"
+CATALOG_ROOT=/usr/share/playfusion/databases
+COVER_ROOT=https://raw.githubusercontent.com/libretro-thumbnails
+
+log() {
+    logger -t kazeta-optical "$*"
+    printf '%s\n' "$*"
+}
+
+remove_virtual_cart() {
+    local stream_device=""
+
+    if mountpoint -q "$VISIBLE_CART"; then
+        umount "$VISIBLE_CART"
+    fi
+    if [ -r "$STATE_DIR/device" ]; then
+        stream_device=$(basename "$(cat "$STATE_DIR/device")")
+    fi
+    if [ -n "$stream_device" ]; then
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+    fi
+    rmdir "$VISIBLE_CART" 2>/dev/null || true
+    rm -f "$STATE_DIR/ready" "$STATE_DIR/cart-id" "$STATE_DIR/device"
+}
+
+find_runtime() {
+    local name=$1
+    local candidate
+
+    for candidate in \
+        "$RUNTIME_ROOT/$name" \
+        "$RUNTIME_ROOT/$name.kzr" \
+        "$RUNTIME_ROOT/$name-"*.kzr; do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_ps1_bios() {
+    local candidate
+
+    for candidate in \
+        "$FIRMWARE_ROOT/ps1/scph5501.bin" \
+        /var/kazeta/internal-games/*/bios/scph5501.bin \
+        /var/kazeta/internal-games/*/bios/SCPH5501.BIN \
+        /var/kazeta/internal-games/*/*/bios/scph5501.bin \
+        /var/kazeta/internal-games/*/*/bios/SCPH5501.BIN; do
+        if [ -f "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_ps2_bios_dir() {
+    local candidate
+
+    for candidate in \
+        "$FIRMWARE_ROOT/ps2" \
+        /var/kazeta/internal-games/*/bios \
+        /var/kazeta/internal-games/*/*/bios; do
+        if [ -d "$candidate" ] &&
+            find "$candidate" -maxdepth 1 -type f \
+                \( -iname '*.bin' -o -iname '*.rom0' \) \
+                -print -quit | grep -q .; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_console_firmware_dir() {
+    local platform=$1
+    local candidate
+
+    for candidate in \
+        "$FIRMWARE_ROOT/$platform" \
+        /var/kazeta/internal-games/*/bios \
+        /var/kazeta/internal-games/*/*/bios; do
+        [ -d "$candidate" ] || continue
+        case "$platform" in
+            segacd)
+                find "$candidate" -maxdepth 1 -type f \
+                    \( -iname 'bios_CD_U.bin' -o -iname 'bios_CD_E.bin' \
+                       -o -iname 'bios_CD_J.bin' \) -print -quit |
+                    grep -q . || continue
+                ;;
+            saturn)
+                find "$candidate" -maxdepth 1 -type f \
+                    \( -iname 'sega_101.bin' -o -iname 'mpr-17933.bin' \) \
+                    -print -quit | grep -q . || continue
+                ;;
+            pcengine)
+                find "$candidate" -maxdepth 1 -type f -iname 'syscard3.pce' \
+                    -print -quit | grep -q . || continue
+                ;;
+            dreamcast)
+                # Flycast can use its built-in HLE BIOS. User-supplied firmware,
+                # when present, is still passed through to the runtime.
+                ;;
+            *)
+                return 1
+                ;;
+        esac
+        printf '%s\n' "$candidate"
+        return 0
+    done
+    [ "$platform" = dreamcast ]
+}
+
+sanitize_serial() {
+    printf '%s' "$1" |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+//g'
+}
+
+catalog_title() {
+    local platform=$1
+    local identifier=$2
+    local fallback=${3:-}
+    local database key title_key
+
+    database="$CATALOG_ROOT/$platform-titles.tsv"
+    key=$(sanitize_serial "$identifier")
+    [ -r "$database" ] || return 1
+    title_key=$(printf '%s' "$fallback" |
+        sed -E 's/[[:space:]]+\(.*$//' |
+        tr '[:upper:]' '[:lower:]' |
+        sed -E 's/[^a-z0-9]+//g')
+    awk -F '\t' -v wanted="$key" '
+        $1 == wanted {
+            separator = index($0, "\t")
+            print substr($0, separator + 1)
+            exit
+        }
+    ' "$database"
+    if [ -n "$title_key" ]; then
+        awk -F '\t' -v wanted="name$title_key" '
+            $1 == wanted {
+                separator = index($0, "\t")
+                print substr($0, separator + 1)
+                exit
+            }
+        ' "$database"
+    fi
+}
+
+resolve_catalog_title() {
+    local platform=$1
+    local identifier=$2
+    local fallback=$3
+    local catalog_title
+
+    catalog_title=$(catalog_title "$platform" "$identifier" "$fallback" |
+        head -n 1 || true)
+    if [ -n "$catalog_title" ]; then
+        printf '%s\n' "$catalog_title"
+        return 0
+    fi
+    printf '%s' "$fallback" | tr '_' ' ' |
+        sed -E 's/[[:space:]]+/ /g; s/(^| )([a-z])/\1\U\2/g'
+}
+
+catalog_cover_repository() {
+    case "$1" in
+        ps1) printf 'Sony_-_PlayStation' ;;
+        ps2) printf 'Sony_-_PlayStation_2' ;;
+        wii) printf 'Nintendo_-_Wii' ;;
+        gamecube) printf 'Nintendo_-_GameCube' ;;
+        dreamcast) printf 'Sega_-_Dreamcast' ;;
+        saturn) printf 'Sega_-_Saturn' ;;
+        segacd) printf 'Sega_-_Mega-CD_-_Sega_CD' ;;
+        pcengine) printf 'NEC_-_PC_Engine_CD_-_TurboGrafx-CD' ;;
+        *) return 1 ;;
+    esac
+}
+
+cache_catalog_cover() {
+    local cart_dir=$1
+    local platform=$2
+    local title=$3
+    local repository encoded tmp signature
+
+    if [ -s "$cart_dir/cover.png" ]; then
+        return 0
+    fi
+    command -v curl >/dev/null 2>&1 || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    repository=$(catalog_cover_repository "$platform") || return 1
+    encoded=$(python3 -c \
+        'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' \
+        "$title") || return 1
+    [ -n "$encoded" ] || return 1
+
+    tmp="$cart_dir/.cover.png.$$"
+    rm -f "$tmp"
+    if ! curl -fsSL --connect-timeout 2 --max-time 8 \
+        "$COVER_ROOT/$repository/master/Named_Boxarts/$encoded.png" -o "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+    signature=$(head -c 8 "$tmp" | od -An -tx1 -v | tr -d '[:space:]')
+    if [ "$signature" != 89504e470d0a1a0a ]; then
+        rm -f "$tmp"
+        return 1
+    fi
+    mv -f "$tmp" "$cart_dir/cover.png"
+    chmod 644 "$cart_dir/cover.png"
+
+    # The Data screen caches Icon= for each save.  Optical carts previously
+    # kept the shared platform fallback here, which made every PlayStation
+    # save look like the game whose artwork happened to seed that fallback.
+    # Use the resolved per-game box art as the cart icon whenever it exists.
+    cp -f "$cart_dir/cover.png" "$cart_dir/icon.png"
+    chmod 644 "$cart_dir/icon.png"
+}
+
+resolve_ps1_title() {
+    resolve_catalog_title ps1 "$1" "${2:-PlayStation Disc}"
+}
+
+cache_ps1_cover() {
+    cache_catalog_cover "$1" ps1 "$2"
+}
+
+disc_identity_key() {
+    local device=$1
+    local identity stream_size frame_count middle_frame last_frame
+
+    # Prefer a fingerprint from three raw sectors when the streaming bridge is
+    # available. It is stable even when the USB optical drive drops udev's
+    # cached filesystem properties after a reboot.
+    stream_size=$(stat -c %s /run/kazeta/cdstream/disc.bin 2>/dev/null || printf '0')
+    if [ "$stream_size" -gt 7056 ]; then
+        frame_count=$((stream_size / 2352))
+        middle_frame=$((frame_count / 2))
+        last_frame=$((frame_count - 1))
+        {
+            printf 'raw-size=%s\n' "$stream_size"
+            dd if=/run/kazeta/cdstream/disc.bin bs=2352 skip=16 count=1 status=none
+            dd if=/run/kazeta/cdstream/disc.bin bs=2352 skip="$middle_frame" count=1 status=none
+            dd if=/run/kazeta/cdstream/disc.bin bs=2352 skip="$last_frame" count=1 status=none
+        } | sha256sum | awk '{print $1}'
+        return 0
+    fi
+    stream_size=$(stat -c %s /run/kazeta/cdstream/disc.iso 2>/dev/null || printf '0')
+    if [ "$stream_size" -gt 65536 ]; then
+        {
+            printf 'block-size=%s\n' "$stream_size"
+            dd if=/run/kazeta/cdstream/disc.iso bs=4096 count=1 status=none
+            dd if=/run/kazeta/cdstream/disc.iso bs=4096 skip=16 count=1 status=none
+        } | sha256sum | awk '{print $1}'
+        return 0
+    fi
+
+    identity=$(udevadm info --query=property --name="$device" 2>/dev/null |
+        sed -n -E '/^(ID_FS_UUID|ID_FS_LABEL|ID_FS_SIZE|ID_FS_SYSTEM_ID|ID_FS_APPLICATION_ID)=/p' |
+        LC_ALL=C sort)
+    if [ -z "$identity" ]; then
+        return 1
+    fi
+    printf '%s\n' "$identity" | sha256sum | awk '{print $1}'
+}
+
+remember_ps1_identity() {
+    local device=$1
+    local cart_id=$2
+    local key
+
+    key=$(disc_identity_key "$device" || true)
+    if [ -z "$key" ]; then
+        return 0
+    fi
+    mkdir -p "$CACHE_ROOT/.disc-index"
+    printf '%s\n' "$cart_id" > "$CACHE_ROOT/.disc-index/$key.id"
+}
+
+start_ps1_stream() {
+    local device=$1
+    local cart_id=$2
+    local title=$3
+    local serial=$4
+    local bios=$5
+    local stream_device stream_size stream_cart_dir stream_game_dir
+
+    stream_device=$(basename "$device")
+    if systemctl start "kazeta-cdstream@$stream_device.service" 2>/dev/null; then
+        for _ in $(seq 1 50); do
+            mountpoint -q /run/kazeta/cdstream && break
+            sleep 0.1
+        done
+    fi
+    stream_size=$(stat -c %s /run/kazeta/cdstream/disc.bin 2>/dev/null || printf '0')
+    if [ "$stream_size" -le 0 ]; then
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+        return 1
+    fi
+
+    # Keep one stable lower-directory inode for this cart ID. OverlayFS
+    # records lower file handles in the saved upper layer and will reject a
+    # different lower directory with ESTALE on a later launch.
+    stream_cart_dir="$CACHE_ROOT/$cart_id/cart"
+    stream_game_dir="$stream_cart_dir/game"
+    mkdir -p "$stream_game_dir" "$stream_cart_dir/bios" "$STATE_DIR"
+    cp -f "$bios" "$stream_cart_dir/bios/scph5501.bin"
+    cp -f "$UNKNOWN_ICON" "$stream_cart_dir/icon.png"
+    cache_ps1_cover "$stream_cart_dir" "$title" || true
+
+    cat > "$stream_game_dir/disc.cue" <<'EOF'
+FILE "/run/kazeta/cdstream/disc.bin" BINARY
+  TRACK 01 MODE2/2352
+    INDEX 01 00:00:00
+EOF
+
+    cat > "$stream_cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=game/disc.cue
+Icon=icon.png
+Runtime=playstation-1.01
+GamescopeOptions=--filter pixel
+EOF
+    if [ -s "$stream_cart_dir/cover.png" ]; then
+        printf 'Cover=cover.png\n' >> "$stream_cart_dir/cart.kzi"
+    fi
+
+    chmod -R a+rX "$stream_cart_dir"
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$stream_cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title ($serial) is streaming directly from the PS1 disc. The Play option is now enabled."
+}
+
+stage_known_ps1() {
+    local device=$1
+    local key index_file cart_id cart_dir title serial runtime bios stream_device
+    local identification serial_raw label
+
+    # Starting the bridge reads the TOC and enables a stable raw fingerprint;
+    # it does not copy the disc.
+    stream_device=$(basename "$device")
+    if systemctl start "kazeta-cdstream@$stream_device.service" 2>/dev/null; then
+        for _ in $(seq 1 50); do
+            mountpoint -q /run/kazeta/cdstream && break
+            sleep 0.1
+        done
+    fi
+
+    key=$(disc_identity_key "$device" || true)
+    if [ -z "$key" ]; then
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+        return 1
+    fi
+    index_file="$CACHE_ROOT/.disc-index/$key.id"
+    if [ ! -r "$index_file" ]; then
+        # New PS1 disc: read the ISO9660 PVD, root directory, and SYSTEM.CNF
+        # directly from a handful of Mode-2 sectors. This avoids the slow
+        # kernel ISO mount even on the first insertion.
+        identification=$(
+            /usr/bin/kazeta-ps1-identify /run/kazeta/cdstream/disc.bin 2>/dev/null ||
+                true
+        )
+        if [ -n "$identification" ]; then
+            serial_raw=${identification%%$'\t'*}
+            label=${identification#*$'\t'}
+            serial=$(sanitize_serial "$serial_raw")
+            cart_id="optical-ps1-$serial"
+            title=$(resolve_ps1_title "$serial" "${label:-PlayStation Disc}")
+            runtime=$(find_runtime playstation-1.01 || true)
+            bios=$(find_ps1_bios || true)
+            if [ -n "$serial" ] && [ -n "$runtime" ] && [ -n "$bios" ] &&
+                start_ps1_stream "$device" "$cart_id" "$title" "$serial" "$bios"; then
+                remember_ps1_identity "$device" "$cart_id"
+                return 0
+            fi
+        fi
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+        return 1
+    fi
+
+    cart_id=$(head -n 1 "$index_file")
+    case "$cart_id" in
+        optical-ps1-*) ;;
+        *)
+            systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+            return 1
+            ;;
+    esac
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    if [ ! -r "$cart_dir/cart.kzi" ]; then
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+        return 1
+    fi
+
+    serial=${cart_id#optical-ps1-}
+    title=$(resolve_ps1_title "$serial" \
+        "$(sed -n 's/^Name=//p' "$cart_dir/cart.kzi" | head -n 1)")
+    runtime=$(find_runtime playstation-1.01 || true)
+    bios=$(find_ps1_bios || true)
+    if [ -z "$runtime" ] || [ -z "$bios" ]; then
+        systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+        return 1
+    fi
+
+    start_ps1_stream "$device" "$cart_id" "${title:-PlayStation Disc}" "$serial" "$bios"
+}
+
+start_stream_bridge() {
+    local device=$1
+    local stream_device
+
+    stream_device=$(basename "$device")
+    if systemctl start "kazeta-cdstream@$stream_device.service" 2>/dev/null; then
+        for _ in $(seq 1 50); do
+            mountpoint -q /run/kazeta/cdstream && return 0
+            sleep 0.1
+        done
+    fi
+    systemctl stop "kazeta-cdstream@$stream_device.service" 2>/dev/null || true
+    return 1
+}
+
+read_stream_hex() {
+    local file=$1
+    local offset=$2
+    local count=$3
+
+    dd if="$file" bs=1 skip="$offset" count="$count" status=none 2>/dev/null |
+        od -An -tx1 -v | tr -d '[:space:]'
+}
+
+read_stream_ascii() {
+    local file=$1
+    local offset=$2
+    local count=$3
+
+    dd if="$file" bs=1 skip="$offset" count="$count" status=none 2>/dev/null |
+        tr -d '\000\r\n' |
+        sed -E 's/[^[:print:]]/ /g; s/[[:space:]]+/ /g; s/^ //; s/ $//'
+}
+
+stage_streamed_cart() {
+    local device=$1
+    local platform=$2
+    local title=$3
+    local serial=$4
+    local runtime_name=$5
+    local streamed_file=$6
+    local disc_kind=${7:-disc}
+    local runtime firmware_dir cart_id cart_dir game_dir icon metadata_platform
+
+    runtime=$(find_runtime "$runtime_name" || true)
+    if [ -z "$runtime" ]; then
+        log "$title is recognized as $platform, but $runtime_name.kzr is missing."
+        return 1
+    fi
+
+    firmware_dir=$(find_console_firmware_dir "$platform" || true)
+    case "$platform" in
+        segacd|saturn|pcengine)
+            if [ -z "$firmware_dir" ]; then
+                log "$title is recognized as $platform, but its required user-supplied BIOS is missing."
+                return 1
+            fi
+            ;;
+    esac
+
+    serial=$(sanitize_serial "$serial")
+    [ -n "$serial" ] || return 1
+    cart_id="optical-$platform-$serial"
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    game_dir="$cart_dir/game"
+    mkdir -p "$game_dir" "$cart_dir/bios" "$STATE_DIR"
+
+    rm -f "$game_dir/disc.bin" "$game_dir/disc.cue" "$game_dir/disc.iso"
+    case "$streamed_file" in
+        /run/kazeta/cdstream/disc.cue)
+            cp -f "$streamed_file" "$game_dir/disc.cue"
+            exec_path=game/disc.cue
+            ;;
+        /run/kazeta/cdstream/disc.iso)
+            ln -s "$streamed_file" "$game_dir/disc.iso"
+            exec_path=game/disc.iso
+            ;;
+        *)
+            log "Refusing unsafe optical stream path $streamed_file."
+            return 1
+            ;;
+    esac
+
+    if [ -n "$firmware_dir" ] && [ -d "$firmware_dir" ]; then
+        find "$firmware_dir" -maxdepth 1 -type f -exec cp -f {} "$cart_dir/bios/" \;
+    fi
+    icon="$UNKNOWN_ICON"
+    cp -f "$icon" "$cart_dir/icon.png"
+    case "$disc_kind" in
+        wii|gamecube) metadata_platform=$disc_kind ;;
+        *) metadata_platform=$platform ;;
+    esac
+    cache_catalog_cover "$cart_dir" "$metadata_platform" "$title" || true
+
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=$exec_path
+Icon=icon.png
+Runtime=$runtime_name
+GamescopeOptions=--filter $([ "$platform" = dolphin ] && printf linear || printf pixel)
+EOF
+    if [ -s "$cart_dir/cover.png" ]; then
+        printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+    fi
+    if [ "$disc_kind" = wii ]; then
+        printf 'WiiGamepad=true\n' >> "$cart_dir/cart.kzi"
+    fi
+
+    chmod -R a+rX "$cart_dir"
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title is streaming directly from its $disc_kind disc. The Play option is now enabled."
+}
+
+detect_streamed_dvd() {
+    local device=$1
+    local image=/run/kazeta/cdstream/disc.iso
+    local wii_magic gamecube_magic game_id title serial
+
+    [ -r "$image" ] || return 1
+    wii_magic=$(read_stream_hex "$image" 24 4)
+    gamecube_magic=$(read_stream_hex "$image" 28 4)
+    case "$wii_magic:$gamecube_magic" in
+        5d1c9ea3:*)
+            game_id=$(read_stream_ascii "$image" 0 6)
+            title=$(read_stream_ascii "$image" 32 64)
+            serial=$(sanitize_serial "${game_id:-wii}")
+            [ -n "$title" ] || title="Wii Disc"
+            title=$(resolve_catalog_title wii "${game_id:0:4}" "$title")
+            stage_streamed_cart "$device" dolphin "$title" "$serial" \
+                dolphin-1.0 "$image" wii
+            ;;
+        *:c2339f3d)
+            game_id=$(read_stream_ascii "$image" 0 6)
+            title=$(read_stream_ascii "$image" 32 64)
+            serial=$(sanitize_serial "${game_id:-gamecube}")
+            [ -n "$title" ] || title="GameCube Disc"
+            title=$(resolve_catalog_title gamecube "${game_id:0:4}" "$title")
+            stage_streamed_cart "$device" dolphin "$title" "$serial" \
+                dolphin-1.0 "$image" gamecube
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+detect_streamed_cd() {
+    local device=$1
+    local image=/run/kazeta/cdstream/disc.bin
+    local cue=/run/kazeta/cdstream/disc.cue
+    local meta=/run/kazeta/cdstream/disc.meta
+    local line track_field lba_field type_field mode_field lba type payload
+    local signature system_id volume_id platform runtime title key serial
+    local header_base metadata_serial header_title
+
+    [ -r "$image" ] && [ -r "$cue" ] && [ -r "$meta" ] || return 1
+    while IFS= read -r line; do
+        case "$line" in TRACK=*) ;; *) continue ;; esac
+        IFS=$'\t' read -r track_field lba_field type_field mode_field <<< "$line"
+        lba=${lba_field#LBA=}
+        type=${type_field#TYPE=}
+        [ "$type" != AUDIO ] || continue
+        case "$type" in
+            MODE2/2352) payload=24 ;;
+            *) payload=16 ;;
+        esac
+        signature=$(read_stream_ascii "$image" "$((lba * 2352 + payload))" 32)
+        header_base=$((lba * 2352 + payload))
+        case "$signature" in
+            SEGA\ SEGASATURN*)
+                platform=saturn
+                runtime=saturn-1.0
+                metadata_serial=$(read_stream_ascii "$image" "$((header_base + 32))" 10)
+                header_title=$(read_stream_ascii "$image" "$((header_base + 96))" 112)
+                title=${header_title:-Sega Saturn Disc}
+                break
+                ;;
+            SEGADISCSYSTEM*)
+                platform=segacd
+                runtime=segacd-1.0
+                metadata_serial=$(read_stream_ascii "$image" "$((header_base + 384))" 16)
+                header_title=$(read_stream_ascii "$image" "$((header_base + 336))" 48)
+                title=${header_title:-Sega CD Disc}
+                break
+                ;;
+            SEGA\ SEGAKATANA*)
+                platform=dreamcast
+                runtime=dreamcast-1.0
+                metadata_serial=$(read_stream_ascii "$image" "$((header_base + 64))" 10)
+                header_title=$(read_stream_ascii "$image" "$((header_base + 128))" 128)
+                title=${header_title:-Dreamcast Disc}
+                break
+                ;;
+        esac
+
+        # PC Engine/TurboGrafx CD data tracks commonly carry an ISO9660
+        # descriptor. Only claim them when its identifiers explicitly name
+        # the platform; an arbitrary mixed-mode data CD must never auto-boot.
+        system_id=$(read_stream_ascii "$image" \
+            "$(((lba + 16) * 2352 + payload + 8))" 32)
+        volume_id=$(read_stream_ascii "$image" \
+            "$(((lba + 16) * 2352 + payload + 40))" 32)
+        if printf '%s %s\n' "$system_id" "$volume_id" |
+            grep -Eiq 'PC[ _-]?ENGINE|TURBOGRAFX'; then
+            platform=pcengine
+            runtime=pcengine-1.0
+            title=${volume_id:-PC Engine CD Disc}
+            break
+        fi
+    done < "$meta"
+
+    [ -n "${platform:-}" ] || return 1
+    key=$(disc_identity_key "$device" || true)
+    serial=${key:0:16}
+    [ -n "$serial" ] || serial=$(sanitize_serial "$title")
+    title=$(resolve_catalog_title "$platform" \
+        "${metadata_serial:-$serial}" "$title")
+    stage_streamed_cart "$device" "$platform" "$title" "$serial" \
+        "$runtime" "$cue" cd
+}
+
+stage_streamed_console_disc() {
+    local device=$1
+
+    start_stream_bridge "$device" || return 1
+    if detect_streamed_dvd "$device" || detect_streamed_cd "$device"; then
+        return 0
+    fi
+    systemctl stop "kazeta-cdstream@$(basename "$device").service" 2>/dev/null || true
+    return 1
+}
+
+stage_mounted_container() {
+    local device=$1
+    local source_file=$2
+    local platform=$3
+    local runtime_name=$4
+    local disc_kind=$5
+    local key serial title runtime firmware_dir cart_id cart_dir game_dir icon
+    local extension target_name
+
+    runtime=$(find_runtime "$runtime_name" || true)
+    [ -n "$runtime" ] || return 1
+    firmware_dir=$(find_console_firmware_dir "$platform" || true)
+    case "$platform" in
+        segacd|saturn|pcengine) [ -n "$firmware_dir" ] || return 1 ;;
+    esac
+
+    key=$(disc_identity_key "$device" || true)
+    if [ -z "$key" ]; then
+        key=$(
+            {
+                stat -c '%s:%n' "$source_file"
+                dd if="$source_file" bs=4096 count=1 status=none 2>/dev/null
+            } | sha256sum | awk '{print $1}'
+        )
+    fi
+    serial=${key:0:16}
+    title=$(basename "$source_file")
+    title=${title%.*}
+    title=$(printf '%s' "$title" | tr '_' ' ' |
+        sed -E 's/[[:space:]]+/ /g; s/(^| )([a-z])/\1\U\2/g')
+    cart_id="optical-$platform-$serial"
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    game_dir="$cart_dir/game"
+    extension=${source_file##*.}
+    target_name="disc.${extension,,}"
+    mkdir -p "$game_dir" "$cart_dir/bios" "$STATE_DIR"
+    find "$game_dir" -mindepth 1 -maxdepth 1 -delete
+    ln -s "$source_file" "$game_dir/$target_name"
+    if [ -n "$firmware_dir" ] && [ -d "$firmware_dir" ]; then
+        find "$firmware_dir" -maxdepth 1 -type f -exec cp -f {} "$cart_dir/bios/" \;
+    fi
+    icon="$UNKNOWN_ICON"
+    cp -f "$icon" "$cart_dir/icon.png"
+    cache_catalog_cover "$cart_dir" "$disc_kind" "$title" || true
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=game/$target_name
+Icon=icon.png
+Runtime=$runtime_name
+GamescopeOptions=--filter $([ "$platform" = dolphin ] && printf linear || printf pixel)
+EOF
+    if [ -s "$cart_dir/cover.png" ]; then
+        printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+    fi
+    if [ "$disc_kind" = wii ]; then
+        printf 'WiiGamepad=true\n' >> "$cart_dir/cart.kzi"
+    fi
+    chmod -R a+rX "$cart_dir"
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title is ready from its optical data carrier. The Play option is now enabled."
+}
+
+stage_ps1() {
+    local device=$1
+    local media_path=$2
+    local system_cnf=$3
+    local boot_line serial_raw serial cart_id label title runtime bios
+    local cart_dir game_dir image_tmp image_file toc_tmp toc_file ready_file
+
+    boot_line=$(tr -d '\r' < "$system_cnf" |
+        sed -n -E 's/^[[:space:]]*BOOT[[:space:]]*=[[:space:]]*//Ip' |
+        head -n 1)
+    serial_raw=$(printf '%s' "$boot_line" |
+        sed -E 's#.*\\([^;[:space:]]+).*#\1#')
+    serial=$(sanitize_serial "$serial_raw")
+    if [ -z "$serial" ]; then
+        log "PS1 disc found, but its serial could not be read from SYSTEM.CNF."
+        return 1
+    fi
+
+    cart_id="optical-ps1-$serial"
+    # Use udev's cached probe result. Running blkid against a Mode-2 disc can
+    # re-probe the drive and stall for a long time on some USB optical drives.
+    label=$(udevadm info --query=property --name="$device" 2>/dev/null |
+        sed -n 's/^ID_FS_LABEL=//p' | head -n 1)
+    title=$(resolve_ps1_title "$serial" "${label:-PlayStation Disc}")
+
+    runtime=$(find_runtime playstation-1.01 || true)
+    if [ -z "$runtime" ]; then
+        log "PS1 disc $serial is recognized, but playstation-1.01.kzr is missing."
+        return 1
+    fi
+
+    bios=$(find_ps1_bios || true)
+    if [ -z "$bios" ]; then
+        log "PS1 disc $serial is recognized, but scph5501.bin is missing."
+        return 1
+    fi
+
+    # Preferred mode: expose the physical Mode-2 CD as a seekable raw BIN.
+    # Beetle PSX can then use a normal CUE without waiting for a full copy.
+    if start_ps1_stream "$device" "$cart_id" "$title" "$serial" "$bios"; then
+        remember_ps1_identity "$device" "$cart_id"
+        return 0
+    fi
+
+    log "Direct PS1 streaming was unavailable; falling back to the verified internal cache."
+
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    game_dir="$cart_dir/game"
+    image_file="$game_dir/disc.bin"
+    image_tmp="$game_dir/disc.bin.partial"
+    toc_file="$game_dir/disc.toc"
+    toc_tmp="$game_dir/disc.toc.partial"
+    ready_file="$game_dir/.disc-complete"
+    mkdir -p "$game_dir" "$cart_dir/bios" "$STATE_DIR"
+
+    if ! command -v cdrdao >/dev/null; then
+        log "PS1 disc $serial is recognized, but the cdrdao raw-disc reader is missing."
+        return 1
+    fi
+
+    if [ ! -f "$ready_file" ] || [ ! -s "$image_file" ] || [ ! -s "$toc_file" ]; then
+        rm -f "$image_tmp" "$toc_tmp" "$ready_file"
+        log "Preparing $title ($serial) from the optical disc..."
+        # cdrdao needs exclusive access to the optical drive. SYSTEM.CNF has
+        # already been read, so temporarily release the ISO9660 mount while
+        # preserving the same mount directory for the automounter.
+        if mountpoint -q "$media_path"; then
+            umount "$media_path"
+        fi
+        if ! cdrdao read-cd \
+            --device "$device" \
+            --read-raw \
+            --datafile "$image_tmp" \
+            "$toc_tmp"; then
+            rm -f "$image_tmp" "$toc_tmp"
+            log "The raw PlayStation disc copy failed."
+            return 1
+        fi
+        if [ ! -s "$image_tmp" ] || [ ! -s "$toc_tmp" ]; then
+            rm -f "$image_tmp" "$toc_tmp"
+            log "The raw PlayStation disc copy did not produce a complete BIN/TOC pair."
+            return 1
+        fi
+
+        mv -f "$image_tmp" "$image_file"
+        sed -E 's#^DATAFILE "[^"]*"#DATAFILE "disc.bin"#' \
+            "$toc_tmp" > "$toc_file"
+        rm -f "$toc_tmp"
+        sync "$image_file" "$toc_file"
+        touch "$ready_file"
+    fi
+
+    cp -f "$bios" "$cart_dir/bios/scph5501.bin"
+    cp -f "$UNKNOWN_ICON" "$cart_dir/icon.png"
+    cache_ps1_cover "$cart_dir" "$title" || true
+
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=game/disc.toc
+Icon=icon.png
+Runtime=playstation-1.01
+GamescopeOptions=--filter pixel
+EOF
+    if [ -s "$cart_dir/cover.png" ]; then
+        printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+    fi
+
+    chmod 644 \
+        "$cart_dir/cart.kzi" \
+        "$cart_dir/icon.png" \
+        "$cart_dir/bios/scph5501.bin" \
+        "$toc_file" \
+        "$image_file"
+
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title ($serial) is ready. The Play option is now enabled."
+}
+
+stage_ps2() {
+    local device=$1
+    local media_path=$2
+    local system_cnf=$3
+    local boot_line serial_raw serial cart_id label title runtime bios_dir
+    local cart_dir game_dir image_file image_tmp ready_file expected_size actual_size
+    local media_properties disc_kind
+
+    boot_line=$(tr -d '\r' < "$system_cnf" |
+        sed -n -E 's/^[[:space:]]*BOOT2[[:space:]]*=[[:space:]]*//Ip' |
+        head -n 1)
+    serial_raw=$(printf '%s' "$boot_line" |
+        sed -E 's#.*\\([^;[:space:]]+).*#\1#')
+    serial=$(sanitize_serial "$serial_raw")
+    if [ -z "$serial" ]; then
+        log "PS2 disc found, but its serial could not be read from SYSTEM.CNF."
+        return 1
+    fi
+
+    cart_id="optical-ps2-$serial"
+    label=$(udevadm info --query=property --name="$device" 2>/dev/null |
+        sed -n 's/^ID_FS_LABEL=//p' | head -n 1)
+    title=$(resolve_catalog_title ps2 "$serial" "${label:-PlayStation 2 Disc}")
+
+    runtime=$(find_runtime playstation2-1.0 || true)
+    if [ -z "$runtime" ]; then
+        log "PS2 disc $serial is recognized, but playstation2-1.0.kzr is missing."
+        return 1
+    fi
+
+    bios_dir=$(find_ps2_bios_dir || true)
+    if [ -z "$bios_dir" ]; then
+        log "PS2 disc $serial is recognized, but a user-supplied PS2 BIOS is missing."
+        return 1
+    fi
+
+    # PCSX2 supports physical host drives directly. Build only the metadata
+    # cart and leave all game data on the inserted PS2 disc.
+    # Keep the lower directory stable across cached/direct launch modes.
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    mkdir -p "$cart_dir/bios" "$STATE_DIR"
+    mountpoint -q "$media_path" && umount "$media_path"
+
+    find "$bios_dir" -maxdepth 1 -type f \
+        \( -iname '*.bin' -o -iname '*.rom0' -o -iname '*.rom1' -o -iname '*.rom2' \
+           -o -iname '*.erom' -o -iname '*.nvm' -o -iname '*.mec' \) \
+        -exec cp -f {} "$cart_dir/bios/" \;
+    cp -f "$UNKNOWN_ICON" "$cart_dir/icon.png"
+    cache_catalog_cover "$cart_dir" ps2 "$title" || true
+
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=device:$device
+Icon=icon.png
+Runtime=playstation2-1.0
+GamescopeOptions=--filter linear
+EOF
+    if [ -s "$cart_dir/cover.png" ]; then
+        printf 'Cover=cover.png\n' >> "$cart_dir/cart.kzi"
+    fi
+
+    chmod -R a+rX "$cart_dir"
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title ($serial) is ready to run directly from the PS2 disc. The Play option is now enabled."
+    return 0
+
+    # Retained cache implementation for future recovery/debug builds.
+    media_properties=$(udevadm info --query=property --name="$device" 2>/dev/null || true)
+    if printf '%s\n' "$media_properties" | grep -q '^ID_CDROM_MEDIA_DVD=1$'; then
+        disc_kind=dvd
+    else
+        disc_kind=cd
+    fi
+
+    cart_dir="$CACHE_ROOT/$cart_id/cart"
+    game_dir="$cart_dir/game"
+    mkdir -p "$game_dir" "$cart_dir/bios" "$STATE_DIR"
+
+    if [ "$disc_kind" = dvd ]; then
+        image_file="$game_dir/disc.iso"
+        image_tmp="$game_dir/disc.iso.partial"
+        ready_file="$game_dir/.disc-complete"
+        expected_size=$(blockdev --getsize64 "$device" 2>/dev/null || printf '0')
+        actual_size=$(stat -c %s "$image_file" 2>/dev/null || printf '0')
+
+        if [ "$expected_size" -le 0 ]; then
+            log "Unable to determine the size of PS2 DVD $device."
+            return 1
+        fi
+        if [ ! -f "$ready_file" ] || [ "$actual_size" -ne "$expected_size" ]; then
+            rm -f "$image_tmp" "$ready_file"
+            log "Preparing $title ($serial) from the PS2 DVD..."
+            mountpoint -q "$media_path" && umount "$media_path"
+            if ! dd if="$device" of="$image_tmp" bs=4M conv=fsync status=progress; then
+                rm -f "$image_tmp"
+                log "The PS2 DVD copy failed."
+                return 1
+            fi
+            actual_size=$(stat -c %s "$image_tmp")
+            if [ "$actual_size" -ne "$expected_size" ]; then
+                rm -f "$image_tmp"
+                log "The PS2 DVD copy was incomplete."
+                return 1
+            fi
+            mv -f "$image_tmp" "$image_file"
+            sync "$image_file"
+            touch "$ready_file"
+        fi
+    else
+        image_file="$game_dir/disc.bin"
+        image_tmp="$game_dir/disc.bin.partial"
+        ready_file="$game_dir/.disc-complete"
+
+        if ! command -v cdrdao >/dev/null; then
+            log "PS2 CD $serial is recognized, but the cdrdao raw-disc reader is missing."
+            return 1
+        fi
+        if [ ! -f "$ready_file" ] || [ ! -s "$image_file" ]; then
+            rm -f "$image_tmp" "$game_dir/disc.toc.partial" "$ready_file"
+            log "Preparing $title ($serial) from the PS2 CD..."
+            mountpoint -q "$media_path" && umount "$media_path"
+            if ! cdrdao read-cd \
+                --device "$device" \
+                --read-raw \
+                --datafile "$image_tmp" \
+                "$game_dir/disc.toc.partial"; then
+                rm -f "$image_tmp" "$game_dir/disc.toc.partial"
+                log "The PS2 CD copy failed."
+                return 1
+            fi
+            rm -f "$game_dir/disc.toc.partial"
+            if [ ! -s "$image_tmp" ]; then
+                log "The PS2 CD copy did not produce a raw image."
+                return 1
+            fi
+            mv -f "$image_tmp" "$image_file"
+            sync "$image_file"
+            touch "$ready_file"
+        fi
+    fi
+
+    find "$bios_dir" -maxdepth 1 -type f \
+        \( -iname '*.bin' -o -iname '*.rom0' -o -iname '*.rom1' -o -iname '*.rom2' \
+           -o -iname '*.erom' -o -iname '*.nvm' -o -iname '*.mec' \) \
+        -exec cp -f {} "$cart_dir/bios/" \;
+    cp -f "$UNKNOWN_ICON" "$cart_dir/icon.png"
+
+    cat > "$cart_dir/cart.kzi" <<EOF
+Name=$title
+Id=$cart_id
+Exec=game/$(basename "$image_file")
+Icon=icon.png
+Runtime=playstation2-1.0
+GamescopeOptions=--filter linear
+EOF
+
+    chmod -R a+rX "$cart_dir"
+    remove_virtual_cart
+    mkdir -p "$VISIBLE_CART"
+    mount --bind "$cart_dir" "$VISIBLE_CART"
+    mount -o remount,bind,ro "$VISIBLE_CART"
+
+    printf '%s\n' "$cart_id" > "$STATE_DIR/cart-id"
+    printf '%s\n' "$device" > "$STATE_DIR/device"
+    touch "$STATE_DIR/ready"
+    log "$title ($serial) is ready. The Play option is now enabled."
+}
+
+stage_disc() {
+    local device=$1
+    local media_path=$2
+    local system_cnf container extension
+
+    remove_virtual_cart
+    mkdir -p "$STATE_DIR" "$CACHE_ROOT" "$FIRMWARE_ROOT/ps1" \
+        "$FIRMWARE_ROOT/ps2" "$FIRMWARE_ROOT/segacd" \
+        "$FIRMWARE_ROOT/saturn" "$FIRMWARE_ROOT/pcengine" \
+        "$FIRMWARE_ROOT/dreamcast"
+
+    # A normal Kazeta data disc already exposes its own KZI/KZP metadata.
+    if find "$media_path" -maxdepth 2 -type f \
+        \( -iname '*.kzi' -o -iname '*.kzp' \) -print -quit |
+        grep -q .; then
+        log "Kazeta cartridge media detected; optical emulation is not needed."
+        return 0
+    fi
+
+    container=$(find "$media_path" -maxdepth 3 -type f \
+        \( -iname '*.wbfs' -o -iname '*.gcm' -o -iname '*.rvz' \
+           -o -iname '*.gdi' -o -iname '*.cdi' \) -print -quit)
+    if [ -n "$container" ]; then
+        extension=${container##*.}
+        case "${extension,,}" in
+            wbfs)
+                stage_mounted_container "$device" "$container" dolphin \
+                    dolphin-1.0 wii
+                ;;
+            gcm|rvz)
+                stage_mounted_container "$device" "$container" dolphin \
+                    dolphin-1.0 gamecube
+                ;;
+            gdi|cdi)
+                stage_mounted_container "$device" "$container" dreamcast \
+                    dreamcast-1.0 dreamcast
+                ;;
+        esac
+        return
+    fi
+
+    system_cnf=$(find "$media_path" -maxdepth 2 -type f \
+        -iname 'SYSTEM.CNF*' -print -quit)
+    if [ -z "$system_cnf" ]; then
+        log "No PlayStation SYSTEM.CNF was found on $device."
+        return 0
+    fi
+
+    if tr -d '\r' < "$system_cnf" | grep -Eiq '^[[:space:]]*BOOT2[[:space:]]*='; then
+        stage_ps2 "$device" "$media_path" "$system_cnf"
+        return
+    fi
+
+    if tr -d '\r' < "$system_cnf" | grep -Eiq '^[[:space:]]*BOOT[[:space:]]*='; then
+        stage_ps1 "$device" "$media_path" "$system_cnf"
+        return
+    fi
+
+    log "SYSTEM.CNF did not contain a supported PlayStation boot entry."
+}
+
+auto_stage_disc() {
+    local device=$1
+    local media_path=$2
+    local media_properties
+
+    remove_virtual_cart
+    mkdir -p "$STATE_DIR" "$CACHE_ROOT" "$FIRMWARE_ROOT/ps1" \
+        "$FIRMWARE_ROOT/ps2" "$FIRMWARE_ROOT/segacd" \
+        "$FIRMWARE_ROOT/saturn" "$FIRMWARE_ROOT/pcengine" \
+        "$FIRMWARE_ROOT/dreamcast" "$media_path"
+
+    media_properties=$(udevadm info --query=property --name="$device" 2>/dev/null || true)
+    if ! printf '%s\n' "$media_properties" | grep -q '^ID_CDROM_MEDIA=1$'; then
+        log "No readable optical media is present in $device."
+        return 0
+    fi
+
+    # Known PS1 discs can be identified from udev's cached fingerprint. This
+    # bypasses the normal ISO9660 mount, which can spend tens of seconds
+    # retrying invalid 2048-byte reads against Mode-2/2352 PlayStation media.
+    if stage_known_ps1 "$device"; then
+        /usr/bin/playfusion-loose-rom-helper remove 2>/dev/null || true
+        return 0
+    fi
+
+    # Raw console backups often have no mountable PC filesystem. Identify and
+    # expose them before asking the kernel ISO/UDF automounter to handle them.
+    if stage_streamed_console_disc "$device"; then
+        /usr/bin/playfusion-loose-rom-helper remove 2>/dev/null || true
+        return 0
+    fi
+
+    if ! mountpoint -q "$media_path"; then
+        if ! mount "$device" "$media_path"; then
+            log "The inserted disc is not a recognized PlayFusion/Kazeta or supported console disc."
+            return 0
+        fi
+    fi
+    stage_disc "$device" "$media_path"
+    if [ -e "$STATE_DIR/ready" ]; then
+        /usr/bin/playfusion-loose-rom-helper remove 2>/dev/null || true
+    else
+        /usr/bin/playfusion-loose-rom-helper scan 2>/dev/null || true
+    fi
+}
+
+case "${1:-}" in
+    remember)
+        if [ "$#" -ne 3 ]; then
+            echo "Usage: $0 remember /dev/srN CART_ID" >&2
+            exit 2
+        fi
+        remember_ps1_identity "$2" "$3"
+        ;;
+    auto)
+        if [ "$#" -ne 3 ]; then
+            echo "Usage: $0 auto /dev/srN /run/media/srN" >&2
+            exit 2
+        fi
+        auto_stage_disc "$2" "$3"
+        ;;
+    stage)
+        if [ "$#" -ne 3 ]; then
+            echo "Usage: $0 stage /dev/srN /run/media/srN" >&2
+            exit 2
+        fi
+        stage_disc "$2" "$3"
+        ;;
+    remove)
+        remove_virtual_cart
+        ;;
+    *)
+        echo "Usage: $0 {remember DEVICE CART_ID|auto DEVICE MOUNTPOINT|stage DEVICE MOUNTPOINT|remove}" >&2
+        exit 2
+        ;;
+esac

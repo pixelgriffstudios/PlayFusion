@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+APPIMAGE=/usr/lib/playfusion/antimicrox/AntiMicroX.AppImage
+PROFILE_ROOT=/var/kazeta/controller-profiles
+DEFAULT_PROFILE=/usr/share/playfusion/controller-profiles/pc-keyboard-mouse.gamecontroller.amgp
+SELECTOR_PROFILE=/usr/share/playfusion/controller-profiles/profile-selector.gamecontroller.amgp
+SELECTOR_MAPPER_PID=""
+
+stop_selector_mapper() {
+    if [[ -n "$SELECTOR_MAPPER_PID" ]]; then
+        kill "$SELECTOR_MAPPER_PID" 2>/dev/null || true
+        wait "$SELECTOR_MAPPER_PID" 2>/dev/null || true
+        SELECTOR_MAPPER_PID=""
+    fi
+}
+
+start_selector_mapper() {
+    # Make the GTK selectors usable from the couch: D-pad/left stick navigates,
+    # A accepts, B backs out, and the right stick controls the pointer.
+    "$APPIMAGE" \
+        --hidden \
+        --no-tray \
+        --eventgen uinput \
+        --profile "$SELECTOR_PROFILE" \
+        >"$HOME/.kazeta/var/controller-profile-selector.log" 2>&1 &
+    SELECTOR_MAPPER_PID=$!
+    sleep 0.5
+}
+
+trap stop_selector_mapper EXIT
+
+error() {
+    zenity --error --title="PlayFusion PC Controller Profiles" \
+        --width=620 --text="$1" 2>/dev/null || true
+}
+
+[[ -x "$APPIMAGE" ]] || {
+    error "AntiMicroX is not installed."
+    exit 1
+}
+
+declare -A name_by_id=()
+declare -A runtime_by_id=()
+
+while IFS= read -r -d '' kzi; do
+    # Metadata for native/internal apps may legitimately omit Runtime. Do not
+    # let `set -e` abort the entire scanner when an optional field is absent.
+    id="$(sed -n 's/^Id=//p' "$kzi" | head -n 1)"
+    name="$(sed -n 's/^Name=//p' "$kzi" | head -n 1)"
+    runtime="$(sed -n 's/^Runtime=//p' "$kzi" | head -n 1)"
+    case "${runtime,,}" in
+        windows*|linux*) ;;
+        *) continue ;;
+    esac
+    [[ -n "$id" ]] || continue
+    name_by_id["$id"]="${name:-$id}"
+    runtime_by_id["$id"]="$runtime"
+done < <(
+    find \
+        /var/kazeta/internal-games \
+        /var/kazeta/storage \
+        "$HOME/.local/share/kazeta/cache" \
+        -maxdepth 8 -type f \( -name '*.kzi' -o -name 'metadata.kzi' \) \
+        -print0 2>/dev/null
+)
+
+if ((${#name_by_id[@]} == 0)); then
+    error "No Windows or Linux PC games were found. Launch a physical PC cart once so PlayFusion can add it to this list."
+    exit 0
+fi
+
+mkdir -p "$HOME/.kazeta/var"
+start_selector_mapper
+
+rows=()
+while IFS= read -r id; do
+    state="Disabled"
+    [[ -f "$PROFILE_ROOT/$id/enabled" ]] && state="Enabled"
+    rows+=("$id" "${name_by_id[$id]}" "${runtime_by_id[$id]}" "$state")
+done < <(printf '%s\n' "${!name_by_id[@]}" | sort)
+
+selection="$(
+    zenity --list --title="PlayFusion PC Controller Profiles" \
+        --width=900 --height=600 \
+        --text="Choose a keyboard-only PC game. Emulator runtimes are intentionally excluded." \
+        --column="Game ID" --column="Game" --column="Runtime" --column="Mapping" \
+        "${rows[@]}" 2>/dev/null
+)" || exit 0
+[[ -n "$selection" ]] || exit 0
+
+profile_dir="$PROFILE_ROOT/$selection"
+profile="$profile_dir/controller.gamecontroller.amgp"
+mkdir -p "$profile_dir"
+if [[ ! -f "$profile" ]]; then
+    cp "$DEFAULT_PROFILE" "$profile"
+fi
+
+action="$(
+    zenity --list --radiolist --title="${name_by_id[$selection]}" \
+        --width=700 --height=360 \
+        --text="Edit enables this per-game profile. Disable leaves the profile saved for later." \
+        --column="" --column="Action" \
+        TRUE "EDIT AND ENABLE PROFILE" \
+        FALSE "DISABLE PROFILE" \
+        FALSE "TEST ON-SCREEN KEYBOARD" 2>/dev/null
+)" || exit 0
+
+case "$action" in
+    "EDIT AND ENABLE PROFILE")
+        touch "$profile_dir/enabled"
+        stop_selector_mapper
+        "$APPIMAGE" --no-tray --eventgen uinput --profile "$profile"
+        ;;
+    "DISABLE PROFILE")
+        rm -f "$profile_dir/enabled"
+        zenity --info --title="PlayFusion PC Controller Profiles" \
+            --text="Controller-to-keyboard mapping disabled for ${name_by_id[$selection]}." \
+            2>/dev/null || true
+        ;;
+    "TEST ON-SCREEN KEYBOARD")
+        if command -v onboard >/dev/null; then
+            /usr/bin/playfusion-osk-toggle
+        else
+            error "The Onboard on-screen keyboard is not installed."
+        fi
+        ;;
+esac

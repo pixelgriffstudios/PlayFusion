@@ -17,6 +17,15 @@ page. The installer is distributed as numbered parts because the complete raw
 disk image is larger than GitHub's per-asset limit. Download every part and use
 the included Windows or Linux rebuild script before flashing the IMG.
 
+## Documentation and runtimes
+
+- **[PlayFusion User Wiki](https://github.com/pixelgriffstudios/PlayFusion/wiki)** — setup and instructions for games, removable media, movies, music,
+  profiles, saves, controllers, themes, storage, discs, networking, and
+  troubleshooting.
+- **[Runtime downloads](https://github.com/pixelgriffstudios/PlayFusion-Runtimes/releases/latest)** — all 37 downloadable `.kzr` runtime packages for
+  PlayFusion, Kazeta+, and compatible Kazeta installations.
+- **[Runtime catalog and BIOS guide](https://github.com/pixelgriffstudios/PlayFusion-Runtimes)** — system support, installation paths, required firmware, and checksums.
+
 ## Major features
 
 - 38 bundled Kazeta runtimes
@@ -71,4 +80,3 @@ Manager so owners can import legally obtained files after installation.
 - PlayFusion fork and development: Jason Griffith / PixelGriff Studios
 
 See [NOTICE.md](NOTICE.md) and [LICENSE](LICENSE).
-

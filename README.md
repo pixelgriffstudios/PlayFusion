@@ -19,6 +19,9 @@ page. The installer is distributed as numbered parts because the complete raw
 disk image is larger than GitHub's per-asset limit. Download every part and use
 the included Windows or Linux rebuild script before flashing the IMG.
 
+Before installing, review the [changelog](CHANGELOG.md) and
+[current known issues](docs/KNOWN-ISSUES.md).
+
 ## Documentation and runtimes
 
 - **[PlayFusion User Wiki](https://github.com/pixelgriffstudios/PlayFusion/wiki)** — setup and instructions for games, removable media, movies, music,

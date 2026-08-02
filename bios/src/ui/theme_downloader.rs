@@ -19,6 +19,7 @@ use toml;
 
 // --- CONSTANTS ---
 const ITEMS_PER_PAGE: usize = 5;
+const TOOL_OPTION_COUNT: usize = 5;
 
 // --- State Management & Structs ---
 
@@ -72,6 +73,8 @@ struct ThemeToml {
     author: Option<String>,
     description: Option<String>,
     menu_position: Option<String>,
+    profile_badge_position: Option<String>,
+    boot_animation: Option<String>,
     font_color: Option<String>,
     cursor_color: Option<String>,
     background_scroll_speed: Option<String>,
@@ -133,7 +136,8 @@ pub fn update(
     input_state: &InputState,
     current_screen: &mut Screen,
     sound_effects: &SoundEffects,
-    config: &Config,
+    config: &mut Config,
+    loaded_themes: &HashMap<String, crate::theme::Theme>,
 ) {
     if input_state.back {
         sound_effects.play_back(config);
@@ -165,11 +169,34 @@ pub fn update(
                     }
                 }
 
+                // USB/imported themes may not exist in the online release
+                // catalog. Keep them visible so they can still be applied.
+                for folder_name in installed_themes {
+                    if themes.iter().any(|theme| theme.folder_name == folder_name) {
+                        continue;
+                    }
+                    themes.push(local_theme_entry(&folder_name));
+                }
+                themes.sort_by(|left, right| {
+                    left.name.to_lowercase().cmp(&right.name.to_lowercase())
+                });
+
                 state.themes = themes;
                 state.screen_state = DownloaderState::DisplayingList;
             }
             DownloaderMessage::ThemeList(Err(e)) => {
-                state.screen_state = DownloaderState::Error(e);
+                // Theme activation and reset must keep working offline. Show
+                // locally installed themes and management tools even when the
+                // GitHub catalog cannot be reached.
+                state.themes = get_installed_theme_folders()
+                    .into_iter()
+                    .map(|folder_name| local_theme_entry(&folder_name))
+                    .collect();
+                state.themes.sort_by(|left, right| {
+                    left.name.to_lowercase().cmp(&right.name.to_lowercase())
+                });
+                eprintln!("[Theme Manager] Online catalog unavailable: {e}");
+                state.screen_state = DownloaderState::DisplayingList;
             }
             DownloaderMessage::InstallResult(Ok(theme_name)) => {
                 state.screen_state =
@@ -196,8 +223,12 @@ pub fn update(
 
     match &mut state.screen_state {
         DownloaderState::DisplayingList => {
-            let total_options =
-                state.themes.len() + if state.has_audio_tools_option { 3 } else { 0 };
+            let total_options = state.themes.len()
+                + if state.has_audio_tools_option {
+                    TOOL_OPTION_COUNT
+                } else {
+                    0
+                };
             if total_options == 0 {
                 return;
             }
@@ -241,11 +272,20 @@ pub fn update(
                     let theme = state.themes[state.selected_index].clone();
 
                     if theme.is_installed {
-                        // Theme is already installed, show confirmation
-                        state.screen_state = DownloaderState::ConfirmRedownload {
-                            theme: theme,
-                            selection: 1, // Default to "NO"
-                        };
+                        if let Some(installed_theme) = loaded_themes.get(&theme.folder_name) {
+                            crate::theme::apply_to_config(config, installed_theme);
+                            config.save();
+                            state.screen_state = DownloaderState::Success(format!(
+                                "'{}' applied. Your other settings were preserved.",
+                                theme.name
+                            ));
+                            *current_screen = Screen::ReloadingThemes;
+                        } else {
+                            state.screen_state = DownloaderState::Error(format!(
+                                "'{}' is installed but its theme.toml could not be loaded.",
+                                theme.name
+                            ));
+                        }
                     } else {
                         // Not installed, download immediately
                         state.screen_state = DownloaderState::Downloading(theme.name.clone());
@@ -255,10 +295,29 @@ pub fn update(
                     // This is the existing logic for audio tools
                     let tool_index = state.selected_index - state.themes.len();
                     if tool_index == 0 {
-                        state.screen_state = DownloaderState::ConfirmConvertToWav { selection: 1 };
+                        state.screen_state = DownloaderState::Converting(
+                            "Scanning USB/SD for themes...".to_string(),
+                        );
+                        import_themes_from_usb(state.tx.clone());
                     } else if tool_index == 1 {
-                        state.screen_state = DownloaderState::ConfirmConvertToOgg { selection: 1 };
+                        if let Some(default_theme) = loaded_themes.get("Default") {
+                            crate::theme::apply_to_config(config, default_theme);
+                            config.save();
+                            state.screen_state = DownloaderState::Success(
+                                "PlayFusion default theme restored. Your other settings were preserved."
+                                    .to_string(),
+                            );
+                            *current_screen = Screen::ReloadingThemes;
+                        } else {
+                            state.screen_state = DownloaderState::Error(
+                                "The built-in PlayFusion default theme is unavailable.".to_string(),
+                            );
+                        }
                     } else if tool_index == 2 {
+                        state.screen_state = DownloaderState::ConfirmConvertToWav { selection: 1 };
+                    } else if tool_index == 3 {
+                        state.screen_state = DownloaderState::ConfirmConvertToOgg { selection: 1 };
+                    } else if tool_index == 4 {
                         // New option
                         state.screen_state = DownloaderState::ConfirmDeleteAllBGM { selection: 1 };
                     }
@@ -297,7 +356,13 @@ pub fn update(
                     let theme_path = get_user_data_dir()
                         .unwrap()
                         .join("themes")
-                        .join(theme_folder_name);
+                        .join(theme_folder_name.as_str());
+                    if config.theme == theme_folder_name.as_str() {
+                        if let Some(default_theme) = loaded_themes.get("Default") {
+                            crate::theme::apply_to_config(config, default_theme);
+                            config.save();
+                        }
+                    }
                     match fs::remove_dir_all(&theme_path) {
                         Ok(_) => {
                             state.screen_state = DownloaderState::Success(format!(
@@ -475,8 +540,12 @@ pub fn draw(
             );
         }
         DownloaderState::DisplayingList => {
-            let total_options =
-                state.themes.len() + if state.has_audio_tools_option { 3 } else { 0 };
+            let total_options = state.themes.len()
+                + if state.has_audio_tools_option {
+                    TOOL_OPTION_COUNT
+                } else {
+                    0
+                };
             if total_options == 0 {
                 text_with_config_color(
                     font_cache,
@@ -510,7 +579,9 @@ pub fn draw(
 
                 let display_text = if i < state.themes.len() {
                     let theme = &state.themes[i];
-                    let installed_flag = if theme.is_installed {
+                    let installed_flag = if config.theme == theme.folder_name {
+                        " [ACTIVE]"
+                    } else if theme.is_installed {
                         " [INSTALLED]"
                     } else {
                         ""
@@ -519,8 +590,12 @@ pub fn draw(
                 } else {
                     let tool_index = i - state.themes.len();
                     if tool_index == 0 {
-                        "Audio Tools: Convert .OGG to .WAV".to_string()
+                        "Import Theme from USB / SD".to_string()
                     } else if tool_index == 1 {
+                        "Reset to PlayFusion Default Theme".to_string()
+                    } else if tool_index == 2 {
+                        "Audio Tools: Convert .OGG to .WAV".to_string()
+                    } else if tool_index == 3 {
                         "Audio Tools: Convert .WAV to .OGG".to_string()
                     } else {
                         "Audio Tools: Delete All BGM Tracks".to_string()
@@ -556,8 +631,12 @@ pub fn draw(
             } else {
                 let tool_index = state.selected_index - state.themes.len();
                 if tool_index == 0 {
-                    "Converts space-saving .ogg files into faster-loading .wav files.\n\nThis uses more disk space.".to_string()
+                    "Imports compatible PlayFusion or Kazeta+ theme folders and safe ZIP files from USB/SD.\n\nOptional system-folders artwork is preserved; older themes continue to use built-in folder covers.".to_string()
                 } else if tool_index == 1 {
+                    "Restores the built-in PlayFusion logo, Retro Laser Grid background, font, colors, cursor and sounds.\n\nResolution, audio, profiles, network and other system settings are preserved.".to_string()
+                } else if tool_index == 2 {
+                    "Converts space-saving .ogg files into faster-loading .wav files.\n\nThis uses more disk space.".to_string()
+                } else if tool_index == 3 {
                     "Converts large .wav files into space-saving .ogg files.\n\nThis may increase theme loading times.".to_string()
                 } else {
                     // New description
@@ -593,7 +672,7 @@ pub fn draw(
 
             // Draw pagination controls and hint text
             let hint_y = container_y + container_h - 20.0;
-            let hint_text = "Press [SOUTH] to Download, [WEST] to Delete";
+            let hint_text = "[SOUTH] Apply / Download    [WEST] Delete    [EAST] Back";
             let hint_dims =
                 measure_text(hint_text, Some(font), (font_size as f32 * 0.8) as u16, 1.0);
             text_with_config_color(
@@ -920,6 +999,28 @@ fn draw_conversion_dialog(
 
 // --- Background Thread Functions ---
 
+fn import_themes_from_usb(tx: Sender<DownloaderMessage>) {
+    thread::spawn(move || {
+        let result = match Command::new("/usr/bin/playfusion-theme-import").output() {
+            Ok(output) if output.status.success() => {
+                Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+            }
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                let message = if !stdout.trim().is_empty() {
+                    stdout
+                } else {
+                    stderr
+                };
+                Err(message.trim().to_string())
+            }
+            Err(error) => Err(format!("Unable to start theme importer: {error}")),
+        };
+        let _ = tx.send(DownloaderMessage::ConversionResult(result));
+    });
+}
+
 fn fetch_theme_list(tx: Sender<DownloaderMessage>) {
     thread::spawn(move || {
         let client = reqwest::blocking::Client::builder()
@@ -1126,6 +1227,41 @@ fn update_theme_toml(audio_path: &Path, new_ext: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn local_theme_entry(folder_name: &str) -> RemoteTheme {
+    let metadata = get_user_data_dir()
+        .map(|dir| dir.join("themes").join(folder_name).join("theme.toml"))
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|content| toml::from_str::<ThemeToml>(&content).ok())
+        .unwrap_or_default();
+    let display_name = folder_name
+        .split(|character| character == '_' || character == '-')
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut characters = part.chars();
+            match characters.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    RemoteTheme {
+        name: if display_name.is_empty() {
+            folder_name.to_string()
+        } else {
+            display_name
+        },
+        folder_name: folder_name.to_string(),
+        author: metadata.author.unwrap_or_else(|| "Local theme".to_string()),
+        description: metadata
+            .description
+            .unwrap_or_else(|| "Imported from USB / SD storage.".to_string()),
+        download_url: String::new(),
+        is_installed: true,
+    }
 }
 
 /// Scans the user's themes directory and returns a HashSet of installed theme folder names.

@@ -113,10 +113,7 @@ impl MediaLibraryState {
     }
 
     pub fn refresh(&mut self, kind: MediaLibraryKind) {
-        let selected_id = self
-            .items
-            .get(self.selection)
-            .map(|item| item.id.clone());
+        let selected_id = self.items.get(self.selection).map(|item| item.id.clone());
         let output = Command::new("sudo")
             .args(["-n", HELPER, "list", kind.argument()])
             .output();
@@ -284,8 +281,8 @@ impl MediaLibraryState {
             return MediaLibraryEvent::Move;
         }
         if input.next && page_end < self.items.len() {
-            self.selection = (self.selection + ITEMS_PER_PAGE)
-                .min(self.items.len().saturating_sub(1));
+            self.selection =
+                (self.selection + ITEMS_PER_PAGE).min(self.items.len().saturating_sub(1));
             return MediaLibraryEvent::Move;
         }
         if input.secondary {
@@ -297,9 +294,7 @@ impl MediaLibraryState {
             };
         }
         if input.select {
-            return MediaLibraryEvent::Launch(PathBuf::from(
-                &self.items[self.selection].path,
-            ));
+            return MediaLibraryEvent::Launch(PathBuf::from(&self.items[self.selection].path));
         }
         MediaLibraryEvent::None
     }
@@ -343,11 +338,7 @@ impl MediaLibraryState {
         let title_size = (16.0 * scale_factor) as u16;
         let body_size = (10.0 * scale_factor).max(9.0) as u16;
         let small_size = (8.0 * scale_factor).max(8.0) as u16;
-        let title = format!(
-            "{}  |  {} ITEM(S)",
-            kind.title(),
-            self.items.len()
-        );
+        let title = format!("{}  |  {} ITEM(S)", kind.title(), self.items.len());
         let title_dims = measure_text(&title, Some(font), title_size, 1.0);
         text_with_config_color(
             font_cache,
@@ -491,17 +482,15 @@ impl MediaLibraryState {
             }
         }
 
-        if let Some(message) = self
-            .busy_message
-            .as_ref()
-            .or_else(|| self.notice.as_ref().and_then(|(message, started)| {
+        if let Some(message) = self.busy_message.as_ref().or_else(|| {
+            self.notice.as_ref().and_then(|(message, started)| {
                 if get_time() - *started < 4.0 {
                     Some(message)
                 } else {
                     None
                 }
-            }))
-        {
+            })
+        }) {
             let overlay_width = 300.0 * scale_factor;
             let overlay_height = 62.0 * scale_factor;
             let overlay_x = (screen_width() - overlay_width) * 0.5;

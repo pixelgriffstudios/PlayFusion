@@ -1,16 +1,14 @@
 use crate::{
     audio::SoundEffects, config::Config, get_current_font, render_background,
-    text_with_config_color, wrap_text, BackgroundState, InputState, Screen, VideoPlayer, FONT_SIZE,
-    VERSION_NUMBER,
+    text_with_config_color, wrap_text, BackgroundState, InputState, Screen, VideoPlayer,
+    CURRENT_UPDATE_VERSION, FONT_SIZE, VERSION_NUMBER,
 };
 use macroquad::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs,
-    io::{self, Write},
-    os::unix::fs::PermissionsExt,
+    fs, io,
     path::{Path, PathBuf},
     process::{exit, Command},
     sync::mpsc::{channel, Receiver, Sender},
@@ -481,7 +479,8 @@ fn check_for_updates(tx: Sender<CheckerMessage>) {
         }
 
         let client = match reqwest::blocking::Client::builder()
-            .user_agent("KazetaPlus-Updater")
+            .user_agent("PlayFusion-Updater/1")
+            .timeout(std::time::Duration::from_secs(20))
             .build()
         {
             Ok(c) => c,
@@ -493,21 +492,32 @@ fn check_for_updates(tx: Sender<CheckerMessage>) {
         };
 
         let response = client
-            .get("https://api.github.com/repos/the-outcaster/kazeta-plus/releases")
+            .get("https://api.github.com/repos/pixelgriffstudios/PlayFusion/releases/latest")
             .send();
 
         let result = match response {
             Ok(resp) => {
                 if resp.status().is_success() {
-                    match resp.json::<Vec<GithubRelease>>() {
-                        Ok(releases) => {
-                            if let Some(latest_release) = releases.get(0) {
-                                // No need for mut here
-                                if latest_release.tag_name != VERSION_NUMBER {
-                                    Ok(UpdateCheckResult::UpdateAvailable(latest_release.clone()))
-                                } else {
-                                    Ok(UpdateCheckResult::UpToDate)
-                                }
+                    match resp.json::<GithubRelease>() {
+                        Ok(latest_release) => {
+                            let package_name =
+                                format!("PlayFusion-update-{}.pfu", latest_release.tag_name);
+                            let complete_signed_package = latest_release
+                                .assets
+                                .iter()
+                                .any(|asset| asset.name == package_name)
+                                && latest_release
+                                    .assets
+                                    .iter()
+                                    .any(|asset| asset.name == format!("{}.sha256", package_name))
+                                && latest_release
+                                    .assets
+                                    .iter()
+                                    .any(|asset| asset.name == format!("{}.sig", package_name));
+                            if is_newer_version(&latest_release.tag_name, CURRENT_UPDATE_VERSION)
+                                && complete_signed_package
+                            {
+                                Ok(UpdateCheckResult::UpdateAvailable(latest_release))
                             } else {
                                 Ok(UpdateCheckResult::UpToDate)
                             }
@@ -524,123 +534,94 @@ fn check_for_updates(tx: Sender<CheckerMessage>) {
     });
 }
 
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    fn parse(value: &str) -> Option<(u32, u32, u32)> {
+        let numbers = value.trim_start_matches('v').split('.').collect::<Vec<_>>();
+        if numbers.len() != 3 {
+            return None;
+        }
+        Some((
+            numbers[0].parse().ok()?,
+            numbers[1].parse().ok()?,
+            numbers[2].parse().ok()?,
+        ))
+    }
+    matches!((parse(candidate), parse(current)), (Some(next), Some(now)) if next > now)
+}
+
 // This function now returns a Result, so we can catch all errors
 fn perform_update_logic(
     release_info: GithubRelease,
     tx: Sender<UpdateProgressMessage>,
 ) -> Result<(), String> {
-    let update_asset = match release_info
+    let package_name = release_info
         .assets
         .iter()
-        .find(|asset| asset.name.ends_with(".zip"))
-    {
-        Some(asset) => asset,
-        None => return Err("No .zip asset found in the release.".to_string()),
-    };
+        .find(|asset| asset.name.starts_with("PlayFusion-update-") && asset.name.ends_with(".pfu"))
+        .map(|asset| asset.name.clone())
+        .ok_or_else(|| "This release has no PlayFusion .pfu update package.".to_string())?;
+    let checksum_name = format!("{}.sha256", package_name);
+    let signature_name = format!("{}.sig", package_name);
+    let required = [&package_name, &checksum_name, &signature_name];
+    let stage_dir = Path::new("/var/tmp/playfusion-update-download");
+    fs::create_dir_all(stage_dir)
+        .map_err(|error| format!("Unable to create update staging area: {error}"))?;
 
-    let tmp_zip_path = Path::new("/tmp/kazeta-update.zip");
-    let local_source = update_asset
-        .browser_download_url
-        .strip_prefix("file://")
-        .map(PathBuf::from);
-
-    if let Some(source) = &local_source {
-        tx.send(UpdateProgressMessage::Status(
-            "Verifying local update...".to_string(),
-        ))
-        .map_err(|e| e.to_string())?;
-        verify_local_update(source)?;
-        fs::copy(source, tmp_zip_path)
-            .map_err(|e| format!("Failed to stage local update: {}", e))?;
-    } else {
-        tx.send(UpdateProgressMessage::Status(
-            "Downloading update...".to_string(),
-        ))
-        .map_err(|e| e.to_string())?;
-
-        let response = reqwest::blocking::get(&update_asset.browser_download_url)
-            .map_err(|e| format!("Download failed: {}", e))?;
-        let response_bytes = response
-            .bytes()
-            .map_err(|e| format!("Failed to read bytes: {}", e))?;
-
-        let mut tmp_file = fs::File::create(tmp_zip_path)
-            .map_err(|e| format!("Failed to create temp file: {}", e))?;
-        tmp_file
-            .write_all(&response_bytes)
-            .map_err(|e| format!("Failed to save update file: {}", e))?;
-    }
-
-    // extraction
     tx.send(UpdateProgressMessage::Status(
-        "Extracting archive...".to_string(),
+        "Downloading signed PlayFusion update...".to_string(),
     ))
     .map_err(|e| e.to_string())?;
 
-    let tmp_extract_dir = Path::new("/tmp/");
-
-    // Get the expected kit directory name from the asset name
-    let root_dir_name = update_asset
-        .name
-        .strip_suffix(".zip")
-        .unwrap_or(&update_asset.name);
-    let kit_path = tmp_extract_dir.join(root_dir_name); // e.g., /tmp/kazeta-plus-upgrade-kit-1.34
-
-    // Clean up previous attempt if it exists (run before extraction)
-    if kit_path.exists() {
-        fs::remove_dir_all(&kit_path)
-            .map_err(|e| format!("Failed to remove old kit dir: {}", e))?;
+    let client = reqwest::blocking::Client::builder()
+        .user_agent("PlayFusion-Updater/1")
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|error| format!("Unable to create update client: {error}"))?;
+    let mut staged = Vec::new();
+    for name in required {
+        let asset = release_info
+            .assets
+            .iter()
+            .find(|asset| asset.name == *name)
+            .ok_or_else(|| format!("Required signed asset is missing: {name}"))?;
+        let destination = stage_dir.join(name);
+        if let Some(local_path) = asset.browser_download_url.strip_prefix("file://") {
+            fs::copy(local_path, &destination)
+                .map_err(|error| format!("Unable to stage {name}: {error}"))?;
+        } else {
+            let mut response = client
+                .get(&asset.browser_download_url)
+                .send()
+                .and_then(|response| response.error_for_status())
+                .map_err(|error| format!("Unable to download {name}: {error}"))?;
+            let mut output = fs::File::create(&destination)
+                .map_err(|error| format!("Unable to create {name}: {error}"))?;
+            io::copy(&mut response, &mut output)
+                .map_err(|error| format!("Unable to save {name}: {error}"))?;
+        }
+        staged.push(destination);
     }
 
-    // Extract the archive (which creates the kit_path directory)
-    extract_archive(&tmp_zip_path, &tmp_extract_dir)?;
-
-    // Build the script path INSIDE the kit directory
-    let script_path = kit_path.join("upgrade-to-plus.sh"); // e.g., /tmp/kazeta-plus-upgrade-kit-1.34/upgrade-to-plus.sh
-
-    // Add a log to see the exact path being checked
-    println!(
-        "[UPDATE_AGENT] Checking for script at: {}",
-        script_path.display()
-    );
-
-    // Send an error instead of silently returning
-    if !script_path.exists() {
-        let error_msg = format!("Script not found at: {}", script_path.display());
-        eprintln!("[UPDATE_AGENT] {}", error_msg);
-        return Err(error_msg);
-    }
-
-    // Manually set the executable permission for the script.
-    println!("[UPDATE_AGENT] Setting executable permission on upgrade script...");
-
-    // Check metadata and set permissions safely
-    let metadata =
-        fs::metadata(&script_path).map_err(|e| format!("Failed to read script metadata: {}", e))?;
-    let mut perms = metadata.permissions();
-
-    // Set permissions to rwxr-xr-x (0755)
-    perms.set_mode(0o755);
-    fs::set_permissions(&script_path, perms)
-        .map_err(|e| format!("Failed to set permissions: {}", e))?;
-
-    println!("[UPDATE_AGENT] Permissions set. Executing script...");
     tx.send(UpdateProgressMessage::Status(
-        "Applying update... Do not turn off.".to_string(),
+        "Verifying signature and creating rollback...".to_string(),
     ))
     .map_err(|e| e.to_string())?;
-
-    let status = Command::new("sudo")
-        .arg(script_path)
-        .status()
-        .map_err(|e| format!("Failed to run upgrade script: {}", e))?;
-
-    if !status.success() {
-        return Err(format!("Upgrade script failed with status: {}", status));
+    let output = Command::new("sudo")
+        .arg("/usr/bin/playfusion-update-helper")
+        .arg("install")
+        .args(&staged)
+        .output()
+        .map_err(|error| format!("Unable to start the protected updater: {error}"))?;
+    if !output.status.success() {
+        let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if message.is_empty() {
+            "Update failed safely; existing PlayFusion files were preserved.".to_string()
+        } else {
+            message
+        });
     }
-
-    if let Some(source) = local_source {
-        archive_applied_update(&source)?;
+    for path in staged {
+        let _ = fs::remove_file(path);
     }
 
     // Send "Complete" message and let the thread finish
@@ -673,15 +654,20 @@ fn find_local_update() -> Option<GithubRelease> {
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or("");
-            let is_complete_zip = entry.file_type().is_file()
-                && path.extension().and_then(|ext| ext.to_str()) == Some("zip")
+            let is_complete_package = entry.file_type().is_file()
+                && path.extension().and_then(|ext| ext.to_str()) == Some("pfu")
+                && file_name.starts_with("PlayFusion-update-")
                 && !file_name.starts_with('.');
             let is_update_folder = root == Path::new("/var/kazeta/updates")
                 || path
                     .ancestors()
                     .any(|part| part.file_name().and_then(|name| name.to_str()) == Some("updates"));
 
-            if is_complete_zip && is_update_folder {
+            if is_complete_package
+                && is_update_folder
+                && companion_path(path, ".sha256").is_ok_and(|item| item.is_file())
+                && companion_path(path, ".sig").is_ok_and(|item| item.is_file())
+            {
                 candidates.push(path.to_path_buf());
             }
         }
@@ -695,13 +681,23 @@ fn find_local_update() -> Option<GithubRelease> {
     Some(GithubRelease {
         tag_name: format!("LOCAL: {}", file_name),
         body: format!(
-            "Local update found:\n{}\n\nThe package checksum and Kazeta update signature will be verified before installation.",
+            "Local PlayFusion update found:\n{}\n\nIts SHA-256 checksum and PlayFusion signature will be verified before any system file changes.",
             path.display()
         ),
-        assets: vec![GithubAsset {
-            name: file_name,
-            browser_download_url: format!("file://{}", path.display()),
-        }],
+        assets: vec![
+            GithubAsset {
+                name: file_name.clone(),
+                browser_download_url: format!("file://{}", path.display()),
+            },
+            GithubAsset {
+                name: format!("{}.sha256", file_name),
+                browser_download_url: format!("file://{}", companion_path(&path, ".sha256").ok()?.display()),
+            },
+            GithubAsset {
+                name: format!("{}.sig", file_name),
+                browser_download_url: format!("file://{}", companion_path(&path, ".sig").ok()?.display()),
+            },
+        ],
     })
 }
 
@@ -711,112 +707,4 @@ fn companion_path(update: &Path, suffix: &str) -> Result<PathBuf, String> {
         .and_then(|name| name.to_str())
         .ok_or_else(|| "Update package has an invalid filename.".to_string())?;
     Ok(update.with_file_name(format!("{}{}", file_name, suffix)))
-}
-
-fn verify_local_update(update: &Path) -> Result<(), String> {
-    let checksum_path = companion_path(update, ".sha256")?;
-    let signature_path = companion_path(update, ".sig")?;
-
-    if !checksum_path.is_file() || !signature_path.is_file() {
-        return Err("Local update requires matching .sha256 and .sig companion files.".to_string());
-    }
-
-    let expected = fs::read_to_string(&checksum_path)
-        .map_err(|e| format!("Failed to read checksum: {}", e))?
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let output = Command::new("/usr/bin/sha256sum")
-        .arg(update)
-        .output()
-        .map_err(|e| format!("Failed to calculate checksum: {}", e))?;
-    if !output.status.success() {
-        return Err("Failed to calculate the update checksum.".to_string());
-    }
-    let actual = String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if expected.len() != 64 || expected != actual {
-        return Err("Update checksum does not match.".to_string());
-    }
-
-    let status = Command::new("/usr/bin/openssl")
-        .args(["pkeyutl", "-verify", "-pubin"])
-        .arg("-inkey")
-        .arg("/etc/kazeta-update-public.pem")
-        .arg("-sigfile")
-        .arg(&signature_path)
-        .arg("-rawin")
-        .arg("-in")
-        .arg(update)
-        .status()
-        .map_err(|e| format!("Failed to verify update signature: {}", e))?;
-    if !status.success() {
-        return Err("Update signature is invalid or untrusted.".to_string());
-    }
-
-    Ok(())
-}
-
-fn archive_applied_update(update: &Path) -> Result<(), String> {
-    if !update.starts_with("/var/kazeta/updates") {
-        return Ok(());
-    }
-
-    let applied = Path::new("/var/kazeta/updates/applied");
-    fs::create_dir_all(applied)
-        .map_err(|e| format!("Failed to create applied-update folder: {}", e))?;
-
-    for source in [
-        update.to_path_buf(),
-        companion_path(update, ".sha256")?,
-        companion_path(update, ".sig")?,
-    ] {
-        if source.exists() {
-            let destination = applied.join(
-                source
-                    .file_name()
-                    .ok_or_else(|| "Invalid update filename.".to_string())?,
-            );
-            fs::rename(&source, destination)
-                .map_err(|e| format!("Failed to archive applied update: {}", e))?;
-        }
-    }
-    Ok(())
-}
-
-fn extract_archive(archive_path: &Path, destination: &Path) -> Result<(), String> {
-    let file = fs::File::open(archive_path).map_err(|e| format!("Failed to open zip: {}", e))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("Failed to read zip: {}", e))?;
-
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| format!("Failed to read zip entry {}: {}", i, e))?;
-
-        let outpath = match file.enclosed_name() {
-            Some(path) => destination.join(path),
-            None => return Err(format!("Invalid file path in zip entry {}", i)),
-        };
-
-        if (*file.name()).ends_with('/') {
-            fs::create_dir_all(&outpath).map_err(|e| format!("Failed to create dir: {}", e))?;
-        } else {
-            if let Some(p) = outpath.parent() {
-                if !p.exists() {
-                    fs::create_dir_all(&p)
-                        .map_err(|e| format!("Failed to create parent dir: {}", e))?;
-                }
-            }
-            let mut outfile =
-                fs::File::create(&outpath).map_err(|e| format!("Failed to create file: {}", e))?;
-            io::copy(&mut file, &mut outfile)
-                .map_err(|e| format!("Failed to write file: {}", e))?;
-        }
-    }
-    Ok(())
 }

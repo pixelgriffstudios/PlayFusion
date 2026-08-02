@@ -42,6 +42,7 @@ runtime-inspection/
 *.vmdk
 *.kzr
 *.kzp
+tools/bios-android-build.tar.gz
 
 # Private or user-supplied material
 private-firmware/
@@ -79,4 +80,3 @@ firmware/
 *.cdi
 *.gdi
 *.chd
-

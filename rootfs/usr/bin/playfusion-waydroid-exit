@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+# End only the cartridge-scoped Android session. The Waydroid launcher notices
+# the stopped session, exits normally, and lets Kazeta return to its menu.
+pkill -TERM -f '^/usr/bin/playfusion-android-touch-mapper( |$)' >/dev/null 2>&1 || true
+timeout 4 systemctl --user stop playfusion-waydroid-session.service >/dev/null 2>&1 || true
+timeout 6 waydroid session stop >/dev/null 2>&1 || true
+pkill -TERM -f '^bash /usr/bin/playfusion-waydroid-launch ' >/dev/null 2>&1 || true

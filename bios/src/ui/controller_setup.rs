@@ -1,6 +1,7 @@
 use crate::{
-    config::Config, get_current_font, measure_text, render_background,
-    render_ui_overlay_without_version, text_with_config_color,
+    config::Config,
+    get_current_font, measure_text, render_background, render_ui_overlay_without_version,
+    text_with_config_color,
     types::{AnimationState, BackgroundState, BatteryInfo},
     ui::{draw_configured_cursor_frame, text_with_color},
     InputState, VideoPlayer,
@@ -9,10 +10,27 @@ use macroquad::prelude::*;
 use std::{collections::HashMap, process::Command};
 
 const SYSTEMS: &[&str] = &[
-    "DEFAULT", "ARCADE", "NES", "SNES", "NINTENDO 64", "GAME BOY FAMILY",
-    "NINTENDO DS", "NINTENDO 3DS", "GAMECUBE", "WII", "WII U", "SEGA GENESIS",
-    "SEGA CD", "SEGA SATURN", "DREAMCAST", "PLAYSTATION", "PLAYSTATION 2", "PSP",
-    "PLAYSTATION VITA", "ORIGINAL XBOX", "PC GAMES",
+    "DEFAULT",
+    "ARCADE",
+    "NES",
+    "SNES",
+    "NINTENDO 64",
+    "GAME BOY FAMILY",
+    "NINTENDO DS",
+    "NINTENDO 3DS",
+    "GAMECUBE",
+    "WII",
+    "WII U",
+    "SEGA GENESIS",
+    "SEGA CD",
+    "SEGA SATURN",
+    "DREAMCAST",
+    "PLAYSTATION",
+    "PLAYSTATION 2",
+    "PSP",
+    "PLAYSTATION VITA",
+    "ORIGINAL XBOX",
+    "PC GAMES",
 ];
 
 const PRESETS: &[(&str, &str)] = &[

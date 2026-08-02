@@ -392,6 +392,7 @@ pub fn draw(
     scale_factor: f32,
     flash_message: Option<&str>,
     ftp_endpoint: &str,
+    profiles_state: &crate::ui::profiles::ProfilesState,
 ) {
     render_background(background_cache, video_cache, config, background_state);
     // Keep the main screen uncluttered. The clock and GCC polling diagnostic
@@ -569,4 +570,6 @@ pub fn draw(
         footer_y,
         footer_font_size,
     );
+
+    profiles_state.draw_active_badge(font_cache, config, animation_state, scale_factor);
 }

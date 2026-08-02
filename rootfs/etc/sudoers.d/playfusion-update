@@ -1,0 +1,2 @@
+gamer ALL=(root) NOPASSWD: /usr/bin/playfusion-update-helper install *
+gamer ALL=(root) NOPASSWD: /usr/bin/systemctl reboot

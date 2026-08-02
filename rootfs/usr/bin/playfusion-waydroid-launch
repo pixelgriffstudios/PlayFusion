@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+apk=${1:-}
+metadata_tool=/usr/bin/playfusion-apk-metadata
+state_root=/var/kazeta/state/waydroid-apps
+unit=playfusion-waydroid-session.service
+
+fail() {
+    printf 'PlayFusion Android: %s\n' "$*" >&2
+    exit 1
+}
+
+[[ -n "$apk" && -r "$apk" ]] || fail "APK payload is missing or unreadable."
+[[ -x "$metadata_tool" ]] || fail "APK metadata helper is not installed."
+
+package=$($metadata_tool --field package "$apk" 2>/dev/null || true)
+[[ "$package" =~ ^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$ ]] || fail "APK package name is invalid."
+manifest_activity=$($metadata_tool --field activity "$apk" 2>/dev/null || true)
+if [[ "$manifest_activity" == .* ]]; then
+    manifest_activity="${package}${manifest_activity}"
+fi
+
+mkdir -p "$state_root"
+apk_hash=$(sha256sum "$apk" | cut -d' ' -f1)
+hash_file="$state_root/$package.sha256"
+
+session_running() {
+    waydroid status 2>/dev/null | grep -Eq '^Session:[[:space:]]+RUNNING$'
+}
+
+start_session() {
+    # A session created by the BIOS compositor cannot survive Kazeta's switch
+    # into the per-game compositor even though `waydroid status` may briefly
+    # still say RUNNING. Always rebind Android to this cartridge's Wayland
+    # socket before launching an app.
+    # Disable the owning unit before stopping Android. Reversing this order
+    # lets systemd restart the session against the dead previous Gamescope
+    # socket, leaving stale Waydroid mounts for the next cartridge.
+    # Repair Waydroid's packaged no-op hook before every start.  Some builds
+    # use /dev/null here, which LXC tries to execute and reports as exit 126.
+    sudo -n /usr/bin/playfusion-waydroid-prepare >/dev/null 2>&1 || true
+
+    # Waydroid occasionally reports boot_completed immediately before its
+    # graphics composer dies while rebinding from a previous per-game
+    # compositor.  Retry the complete session once instead of returning the
+    # user to PlayFusion with an empty/white screen.
+    for attempt in 1 2; do
+        timeout 4 systemctl --user stop "$unit" >/dev/null 2>&1 || true
+        timeout 6 waydroid session stop >/dev/null 2>&1 || true
+        systemctl --user reset-failed "$unit" >/dev/null 2>&1 || true
+        systemd-run --user --unit=playfusion-waydroid-session --collect \
+            -p Restart=no \
+            --setenv=XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" \
+            --setenv=DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=/run/user/$(id -u)/bus}" \
+            --setenv=WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-gamescope-0}" \
+            /usr/bin/waydroid session start >/dev/null
+
+        # RUNNING only means LXC has started.  Wait for Android, then give the
+        # graphics stack a short stability window and verify both services.
+        ready=false
+        for _ in $(seq 1 90); do
+            if session_running && \
+                [[ "$(sudo -n waydroid shell getprop sys.boot_completed 2>/dev/null || true)" == "1" ]] && \
+                waydroid app list >/dev/null 2>&1; then
+                ready=true
+                break
+            fi
+            sleep 1
+        done
+        if [[ "$ready" == true ]]; then
+            sleep 8
+            surface_state=$(sudo -n waydroid shell getprop init.svc.surfaceflinger 2>/dev/null || true)
+            composer_state=$(sudo -n waydroid shell getprop init.svc.vendor.hwcomposer-2-1 2>/dev/null || true)
+            if session_running && [[ "$surface_state" == "running" && "$composer_state" == "running" ]]; then
+                return 0
+            fi
+        fi
+        printf 'PlayFusion Android: graphics startup failed (attempt %s/2); retrying.\n' "$attempt" >&2
+    done
+    fail "Android graphics did not become stable after two attempts."
+}
+
+# Do not tear Waydroid down from this process' EXIT trap.  The Android
+# Wayland client is connected to the per-game Gamescope compositor; stopping
+# the client while that compositor is handling launcher termination can crash
+# gamescope-wl (SIGSEGV) and make PlayFusion look as though it rebooted.  A
+# stale session is already stopped safely by start_session() before the next
+# Android cartridge is launched, after the previous compositor is gone.
+
+start_session
+
+# PlayFusion supplies its own controller-driven pointer/touch bridge. Clear
+# Waydroid's per-package fake-touch override so Android renders the pointer;
+# the override otherwise accepts input while leaving the cursor invisible.
+sudo -n waydroid shell setprop persist.waydroid.fake_touch "" >/dev/null 2>&1 || true
+sudo -n waydroid shell settings put secure show_ime_with_hard_keyboard 1 >/dev/null 2>&1 || true
+
+# Waydroid remembers its media level independently from the host HDMI sink.
+# Set it in one Binder call; sending sixteen separate key events overloaded a
+# fragile graphics startup and delayed APK launch by several seconds.
+sudo -n waydroid shell cmd media_session volume --stream 3 --set 15 >/dev/null 2>&1 || true
+
+installed=false
+if waydroid app list 2>/dev/null | grep -Fqx "packageName: $package"; then
+    installed=true
+fi
+
+saved_hash=''
+[[ -r "$hash_file" ]] && read -r saved_hash < "$hash_file"
+if [[ "$installed" != true || "$saved_hash" != "$apk_hash" ]]; then
+    # Multiple PlayFusion carts may intentionally carry different builds of
+    # the same Android package. Keep Android app data while replacing the
+    # installed package so version downgrades and signature-compatible test
+    # builds can switch cleanly by cartridge ID.
+    if [[ "$installed" == true && -n "$saved_hash" && "$saved_hash" != "$apk_hash" ]]; then
+        sudo -n waydroid shell -- pm uninstall -k "$package" >/dev/null 2>&1 || true
+        installed=false
+    fi
+    printf 'PlayFusion Android: installing %s...\n' "$package"
+    waydroid app install "$apk"
+    for _ in $(seq 1 30); do
+        if waydroid app list 2>/dev/null | grep -Fqx "packageName: $package"; then
+            installed=true
+            break
+        fi
+        sleep 1
+    done
+    [[ "$installed" == true ]] || fail "Android rejected the APK. Its CPU architecture or package may be unsupported."
+    printf '%s\n' "$apk_hash" > "$hash_file"
+fi
+
+printf 'PlayFusion Android: launching %s\n' "$package"
+if [[ "$manifest_activity" =~ ^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$ ]]; then
+    activity="${package}/${manifest_activity}"
+    sudo -n waydroid shell -- am force-stop "$package" >/dev/null 2>&1 || true
+    # The host-side launcher asks WaydroidPlatform to create and export the
+    # app's Wayland surface.  Starting only through `am` runs the activity
+    # (including audio) but leaves Gamescope displaying the launcher text.
+    waydroid app launch "$package" >/dev/null 2>&1 || true
+    sleep 1
+    # Enforce the exact MAIN/LAUNCHER activity declared by the APK manifest.
+    sudo -n waydroid shell -- am start --user 0 -W -n "$activity"
+else
+    printf 'PlayFusion Android: manifest has no launcher activity; using package fallback.\n' >&2
+    waydroid app launch "$package"
+fi
+
+# The Kazeta game-session manager owns this process. Keeping it alive makes the
+# Android surface behave like any other cartridge; the normal game-exit hotkey
+# terminates us, and the trap above then closes the private Android session.
+while session_running; do
+    sleep 2
+done

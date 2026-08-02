@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Safely import PlayFusion/Kazeta+ themes from removable media."""
+from __future__ import annotations
+import os, re, shutil, stat, tempfile, tomllib, zipfile
+from pathlib import Path
+
+MEDIA_ROOTS = (Path("/run/media/gamer"), Path("/run/media"), Path("/media"))
+THEMES_ROOT = Path.home() / ".local/share/kazeta-plus/themes"
+MAX_FILES = 2000
+MAX_BYTES = 256 * 1024 * 1024
+
+def valid_theme(folder: Path) -> bool:
+    config = folder / "theme.toml"
+    try:
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
+        return isinstance(data, dict)
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError):
+        return False
+
+def safe_name(name: str) -> str:
+    value = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")[:80]
+    return value or "imported-theme"
+
+def install_theme(source: Path) -> str:
+    name = safe_name(source.name)
+    THEMES_ROOT.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=THEMES_ROOT))
+    try:
+        shutil.copytree(source, stage / name, dirs_exist_ok=True, symlinks=False)
+        target = THEMES_ROOT / name
+        if target.exists():
+            shutil.rmtree(target)
+        os.replace(stage / name, target)
+        return name
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+
+def safe_extract(archive_path: Path, destination: Path) -> None:
+    with zipfile.ZipFile(archive_path) as archive:
+        infos = archive.infolist()
+        if len(infos) > MAX_FILES or sum(item.file_size for item in infos) > MAX_BYTES:
+            raise ValueError("theme archive exceeds the safety limit")
+        for item in infos:
+            relative = Path(item.filename)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("unsafe path in theme archive")
+            mode = item.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise ValueError("symbolic links are not allowed in theme archives")
+            target = destination / relative
+            resolved = target.resolve()
+            if destination.resolve() not in resolved.parents and resolved != destination.resolve():
+                raise ValueError("archive path leaves extraction directory")
+        archive.extractall(destination)
+
+def candidates():
+    visited: set[Path] = set()
+    for root in MEDIA_ROOTS:
+        if not root.is_dir():
+            continue
+        for directory, subdirs, files in os.walk(root, followlinks=False):
+            relative_depth = len(Path(directory).relative_to(root).parts)
+            if relative_depth > 5:
+                subdirs[:] = []
+                continue
+            folder = Path(directory)
+            if "theme.toml" in files and folder not in visited:
+                visited.add(folder)
+                yield folder
+            for filename in files:
+                if filename.lower().endswith(".zip"):
+                    yield Path(directory, filename)
+
+def main() -> int:
+    installed: list[str] = []
+    errors: list[str] = []
+    for candidate in candidates():
+        try:
+            if candidate.is_dir():
+                if valid_theme(candidate):
+                    installed.append(install_theme(candidate))
+                continue
+            with tempfile.TemporaryDirectory(prefix="playfusion-theme-import-") as work:
+                extracted = Path(work)
+                safe_extract(candidate, extracted)
+                roots = [path.parent for path in extracted.rglob("theme.toml") if valid_theme(path.parent)]
+                for root in roots:
+                    installed.append(install_theme(root))
+        except (OSError, ValueError, zipfile.BadZipFile) as error:
+            errors.append(f"{candidate.name}: {error}")
+    if installed:
+        names = ", ".join(dict.fromkeys(installed))
+        print(f"Imported {len(set(installed))} theme(s): {names}")
+        return 0
+    if errors:
+        print("No valid themes imported. " + errors[0])
+        return 2
+    print("No theme.toml folder or theme ZIP found on USB/SD media.")
+    return 1
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -139,6 +139,19 @@ else
 	media_path="${cart_path}"
 fi
 cart_id="$(get_attribute 'Id' ${cart_info})"
+
+# Only one cartridge may own the shared runtime/overlay mount at a time. A
+# rapid double-select or a compositor restart used to start a second Kazeta
+# process against the same upperdir, which OverlayFS correctly warns is
+# undefined behavior. The descriptor lock is released automatically whenever
+# the owning game process exits, including after a crash.
+GAME_SESSION_LOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/playfusion-game-session.lock"
+exec 9>"${GAME_SESSION_LOCK}"
+if ! flock -n 9; then
+	echo "DEBUG: A PlayFusion game session is already active; ignoring duplicate launch."
+	exit 0
+fi
+
 cart_icon="${cart_path}/$(get_attribute 'Icon' ${cart_info})"
 cart_cover_name="$(get_attribute 'Cover' "${cart_info}" 2>/dev/null || true)"
 cart_cover=""
@@ -254,6 +267,7 @@ sudo kazeta-mount "${lower}" "${upper}" "${work}" "${target}" "${runtime}" "${ru
 trap "\
 	if [ -n \"\$PLAYTIME_PID\" ]; then kill \"\$PLAYTIME_PID\" 2>/dev/null; fi; \
 	if [ -n \"\$ANTIMICROX_PID\" ]; then kill \"\$ANTIMICROX_PID\" 2>/dev/null; fi; \
+	if [ -n \"\$ANDROID_TOUCH_PID\" ]; then kill \"\$ANDROID_TOUCH_PID\" 2>/dev/null; fi; \
 	if [ -n \"\$ANTIMICROX_PID\" ]; then /usr/bin/playfusion-osk-toggle --stop 2>/dev/null || true; fi; \
 	popd; \
 	sudo kazeta-mount --unmount "${target}" "${runtimedir}"; \
@@ -272,11 +286,19 @@ unset XDG_STATE_HOME
 pushd "${HOME}"
 
 # --- Optional keyboard/mouse controller mapping for PC games ---
-# This feature is opt-in and restricted to the Windows and native Linux
-# runtimes. Emulator runtimes keep their own native controller handling.
+# Android touch carts use the compositor-independent mapper below. Emulator
+# runtimes and native-gamepad Android carts keep direct controller handling.
 ANTIMICROX_PID=""
 keyboard_mapping="$(get_attribute 'KeyboardMapping' "${cart_info}")"
 keyboard_profile="$(get_attribute 'KeyboardProfile' "${cart_info}")"
+android_input="$(get_attribute 'AndroidInput' "${cart_info}")"
+android_mode_file="/var/kazeta/state/android-controller-modes/${cart_id}.mode"
+if [[ -r "${android_mode_file}" ]]; then
+	android_mode="$(tr -d '\r\n' < "${android_mode_file}")"
+	case "${android_mode,,}" in
+		touch|gamepad) android_input="${android_mode,,}" ;;
+	esac
+fi
 saved_profile_dir="/var/kazeta/controller-profiles/${cart_id}"
 saved_profile="${saved_profile_dir}/controller.gamecontroller.amgp"
 
@@ -307,12 +329,29 @@ case "${runtime_name,,}" in
 				--no-tray \
 				--eventgen uinput \
 				--profile "${profile_path}" \
-				> "${HOME}/.kazeta/var/antimicrox.log" 2>&1 &
+				> "${HOME}/.kazeta/var/antimicrox.log" 2>&1 9>&- &
 			ANTIMICROX_PID=$!
 			sleep 0.4
 		fi
 		;;
 esac
+
+ANDROID_TOUCH_PID=""
+if [[ "${runtime_name,,}" == waydroid* ]]; then
+	android_mapper_mode="--exit-only"
+	export PLAYFUSION_ANDROID_INPUT="${android_input,,}"
+	if [[ "${android_input,,}" == "touch" ]]; then
+		android_mapper_mode="--touch"
+		echo "DEBUG: Starting visible Android touch controller mapper."
+	else
+		echo "DEBUG: Starting Android Escape-key listener; native gamepad remains untouched."
+	fi
+	mkdir -p "${HOME}/.kazeta/var"
+	/usr/bin/playfusion-android-touch-mapper "${android_mapper_mode}" \
+		> "${HOME}/.kazeta/var/android-touch-mapper.log" 2>&1 9>&- &
+	ANDROID_TOUCH_PID=$!
+	sleep 0.3
+fi
 
 # --- Apply the persistent Xbox profile to Wii games using Dolphin ---
 # WiiGamepad may be set to true or false in the KZI. When omitted, WBFS/WAD
@@ -359,6 +398,12 @@ fi
 
 cart_exec="$(get_attribute 'Exec' ${cart_info})"
 cart_gsopts="$(get_attribute 'GamescopeOptions' ${cart_info})"
+if [[ "${runtime_name,,}" == waydroid* && "${android_input,,}" == "touch" ]]; then
+	# Gamescope normally hides its software cursor after a short delay. Touch
+	# carts use the left stick as a mouse, so keep that cursor visible for the
+	# full cartridge session (delay is in milliseconds).
+	cart_gsopts="${cart_gsopts} --hide-cursor-delay 86400000"
+fi
 if [[ -z "${cart_gsopts}" && "${runtime_name,,}" == cemu* ]]; then
 	cart_gsopts="-w 1280 -h 720 -W 1920 -H 1080 -r 60 --force-windows-fullscreen -F fsr --sharpness 2"
 fi
@@ -373,8 +418,7 @@ rm -f .kazeta/var/playtime_end
 
 mkdir -p .kazeta/var
 date --iso-8601=seconds > .kazeta/var/playtime_start
-start_playtime_capture &
-PLAYTIME_PID=$! # save PID of background job
+PLAYTIME_PID=""
 
 # --- EXECUTION & ERROR HANDLING ---
 
@@ -383,8 +427,9 @@ START_TIME=$(date +%s)
 
 # 2. Run Gamescope
 # We capture the output to the log file inside the mount
-gamescope ${cart_gsopts} -- ./.kazeta/share/run /tmp/kazeta-cart-exec | grep -v "pressure-vessel-wrap" > "${HOME}/.kazeta/var/run.log" 2>&1
+gamescope ${cart_gsopts} -- ./.kazeta/share/run /tmp/kazeta-cart-exec 9>&- | grep -v "pressure-vessel-wrap" > "${HOME}/.kazeta/var/run.log" 2>&1
 EXIT_CODE=$?
+date --iso-8601=seconds > .kazeta/var/playtime_end
 
 set +x # disable debug tracing
 

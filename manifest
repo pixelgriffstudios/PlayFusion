@@ -1,15 +1,17 @@
 #! /bin/bash
 
-export VERSION="1.43"
-export SYSTEM_DESC="Kazeta+"
+# Keep SYSTEM_NAME compatible with the Kazeta+ build machinery while shipping
+# the PlayFusion product/version identity in every user-facing field.
+export VERSION="1.0.2"
+export SYSTEM_DESC="PlayFusion"
 export SYSTEM_NAME="kazeta-plus"
 export USERNAME="gamer"
 # Temporary build filesystem. The published btrfs-send image contains only
 # used data, so this headroom does not pad the downloadable image to 18 GB.
 export SIZE="18000MB"
-export WEBSITE="https://github.com/the-outcaster/kazeta-plus"
-export DOCUMENTATION_URL="https://github.com/the-outcaster/kazeta-plus/wiki"
-export BUG_REPORT_URL="https://github.com/the-outcaster/kazeta-plus/issues"
+export WEBSITE="https://github.com/pixelgriffstudios/PlayFusion"
+export DOCUMENTATION_URL="https://github.com/pixelgriffstudios/PlayFusion/wiki"
+export BUG_REPORT_URL="https://github.com/pixelgriffstudios/PlayFusion/issues"
 
 export KERNEL_PACKAGE="linux"
 
@@ -22,6 +24,7 @@ export PACKAGES="\
 	brightnessctl \
 	cdrdao \
 	clang \
+	curl \
 	dkms \
 	ffmpeg \
 	fuse2 \
@@ -43,23 +46,27 @@ export PACKAGES="\
 	lib32-vulkan-mesa-layers \
 	lib32-vulkan-radeon \
 	libisoburn \
+	libarchive \
 	lightdm \
 	linux-firmware \
 	linux-headers \
 	lsof \
 	mangohud \
+	mpv \
 	nano \
 	networkmanager \
 	noto-fonts \
 	noto-fonts-emoji \
 	nvidia-open \
 	nvidia-utils \
+	openssl \
 	openssh \
 	pipewire-alsa \
 	pipewire-jack \
 	pipewire-pulse \
 	projectm \
 	projectm-pulseaudio \
+	python \
 	rsync \
 	rtkit \
 	steam \
@@ -74,6 +81,7 @@ export PACKAGES="\
 	vsftpd \
 	wireplumber \
 	xxhash \
+	zstd \
 "
 
 export AUR_PACKAGES="\
@@ -97,6 +105,7 @@ export SERVICES="\
 	kazeta-profile-loader.service \
 	playfusion-storage.service \
 	playfusion-loose-rom.path \
+	playfusion-update-health.service \
 	lightdm.service \
 	NetworkManager.service \
 	sshd.service \
@@ -141,6 +150,10 @@ postinstallhook() {
         chown root:root /usr/bin/kazeta*
         chmod 755 /usr/bin/kazeta*
     fi
+    if [ -f /etc/sudoers.d/playfusion-update ]; then
+        chown root:root /etc/sudoers.d/playfusion-update
+        chmod 440 /etc/sudoers.d/playfusion-update
+    fi
     if compgen -G "/usr/bin/playfusion-*" > /dev/null; then
         chown root:root /usr/bin/playfusion-*
         chmod 755 /usr/bin/playfusion-*
@@ -154,6 +167,7 @@ postinstallhook() {
 
     # Persist kazeta save data
     mkdir -p /var/kazeta/state/wireplumber
+    mkdir -p /var/lib/playfusion-updater/backups
     mkdir -p /var/kazeta/internal-games
     mkdir -p /var/kazeta/runtime-uploads
     mkdir -p /var/kazeta/ftp/internal-games

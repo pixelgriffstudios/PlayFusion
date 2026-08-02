@@ -1,5 +1,5 @@
 use crate::{
-    config::Config,
+    config::{get_user_data_dir, Config},
     get_current_font, render_background, render_ui_overlay_without_version, save,
     text_with_config_color,
     types::{AnimationState, BackgroundState, BatteryInfo},
@@ -82,10 +82,7 @@ pub enum InternalGamesMode {
 }
 
 enum OperationUpdate {
-    Progress {
-        percent: f32,
-        phase: Option<String>,
-    },
+    Progress { percent: f32, phase: Option<String> },
     Finished(Result<String, String>),
 }
 
@@ -113,6 +110,7 @@ pub struct InternalGamesState {
     pub status: String,
     pub free_space: String,
     pub manager_mode: bool,
+    pub theme_name: String,
     pub mode: InternalGamesMode,
     operation_rx: Receiver<OperationUpdate>,
 }
@@ -135,6 +133,7 @@ impl Default for InternalGamesState {
             status: String::new(),
             free_space: String::new(),
             manager_mode: false,
+            theme_name: "Default".to_string(),
             mode: InternalGamesMode::Gallery,
             operation_rx,
         }
@@ -225,8 +224,7 @@ impl InternalGamesState {
         for system in &self.systems {
             self.cover_queue.push((
                 format!("system:{system}"),
-                PathBuf::from("/usr/share/playfusion/system-covers")
-                    .join(format!("{}.png", system_asset_slug(system))),
+                system_cover_path(&self.theme_name, system),
             ));
         }
         self.status = if rejected == 0 {
@@ -263,7 +261,11 @@ impl InternalGamesState {
                         *progress = Some(value.clamp(0.0, 100.0));
                     }
                 }
-                if let Some(phase) = fields.next().map(str::trim).filter(|value| !value.is_empty()) {
+                if let Some(phase) = fields
+                    .next()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
                     *message = format!("{phase}...");
                 }
             }
@@ -367,17 +369,13 @@ impl InternalGamesState {
                     let detail = if last_detail.is_empty() {
                         default_error
                     } else {
-                        last_detail
-                            .strip_prefix("Error: ")
-                            .unwrap_or(&last_detail)
+                        last_detail.strip_prefix("Error: ").unwrap_or(&last_detail)
                     };
                     Err(detail.to_string())
                 }
                 Err(error) => Err(format!("Operation wait failed: {error}")),
             };
-            operation_tx
-                .send(OperationUpdate::Finished(result))
-                .ok();
+            operation_tx.send(OperationUpdate::Finished(result)).ok();
         });
     }
 
@@ -427,9 +425,7 @@ impl InternalGamesState {
                     Some(folder) => folder,
                     None => continue,
                 };
-                if !seen.insert(cart.id.clone())
-                    || !valid_source_cart_paths(folder, &cart, root)
-                {
+                if !seen.insert(cart.id.clone()) || !valid_source_cart_paths(folder, &cart, root) {
                     continue;
                 }
                 if installed_ids.contains(&cart.id) {
@@ -766,9 +762,7 @@ impl InternalGamesState {
                         Err(format!("Deletion exited with {status}"))
                     }
                 });
-            operation_tx
-                .send(OperationUpdate::Finished(result))
-                .ok();
+            operation_tx.send(OperationUpdate::Finished(result)).ok();
         });
     }
 
@@ -1311,9 +1305,7 @@ fn system_for_cart(cart: &save::CartInfo) -> String {
     let id = cart.id.to_ascii_lowercase();
     let value = format!("{runtime} {exec} {id}");
 
-    if value.contains("playfusion-arcade")
-        || value.contains("finalburn")
-        || value.contains("mame")
+    if value.contains("playfusion-arcade") || value.contains("finalburn") || value.contains("mame")
     {
         "Arcade"
     } else if value.contains("playstation2") || value.contains("pcsx2") {
@@ -1377,6 +1369,8 @@ fn system_for_cart(cart: &save::CartInfo) -> String {
         "Atari Lynx"
     } else if value.contains("xemu") {
         "Original Xbox"
+    } else if value.contains("waydroid") || exec.ends_with(".apk") {
+        "Android"
     } else if value.contains("windows") || value.contains("scummvm") {
         "PC Games"
     } else {
@@ -1400,6 +1394,32 @@ fn system_asset_slug(system: &str) -> String {
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("-")
+}
+
+fn system_cover_path(theme_name: &str, system: &str) -> PathBuf {
+    let slug = system_asset_slug(system);
+    let built_in = PathBuf::from("/usr/share/playfusion/system-covers").join(format!("{slug}.png"));
+    if theme_name.is_empty()
+        || theme_name == "."
+        || theme_name == ".."
+        || theme_name.contains('/')
+        || theme_name.contains('\\')
+    {
+        return built_in;
+    }
+    let Some(data_root) = get_user_data_dir() else {
+        return built_in;
+    };
+    let theme_root = data_root.join("themes").join(theme_name);
+    for folder in ["system-folders", "system-covers", "folders"] {
+        for extension in ["png", "jpg", "jpeg", "webp", "avif"] {
+            let candidate = theme_root.join(folder).join(format!("{slug}.{extension}"));
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+    }
+    built_in
 }
 
 fn system_sort_order(system: &str) -> usize {
@@ -1432,6 +1452,7 @@ fn system_sort_order(system: &str) -> usize {
         "DOS",
         "Amiga",
         "Commodore 64",
+        "Android",
         "PC Games",
         "Other",
     ]
@@ -1542,8 +1563,7 @@ fn valid_source_cart_paths(folder: &Path, cart: &save::CartInfo, media_root: &Pa
             Err(_) => return false,
         };
         if !resolved.starts_with(&root)
-            && !(relative == cart.exec
-                && valid_loose_rom_payload_target(cart, &root, &resolved))
+            && !(relative == cart.exec && valid_loose_rom_payload_target(cart, &root, &resolved))
         {
             return false;
         }
@@ -1575,9 +1595,7 @@ fn valid_source_cart_paths(folder: &Path, cart: &save::CartInfo, media_root: &Pa
 }
 
 fn valid_loose_rom_payload_target(cart: &save::CartInfo, cart_root: &Path, target: &Path) -> bool {
-    if !cart.id.starts_with("loose-")
-        || !cart_root.starts_with("/run/media/playfusion-loose-rom")
-    {
+    if !cart.id.starts_with("loose-") || !cart_root.starts_with("/run/media/playfusion-loose-rom") {
         return false;
     }
 
@@ -1818,26 +1836,21 @@ fn draw_mode_overlay(
                 .saturating_sub(maximum_rows / 2)
                 .min(maximum_start);
             let end = (start + maximum_rows).min(games.len());
-            let mut lines = vec![format!(
-                "SHOWING {}-{} OF {}",
-                start + 1,
-                end,
-                games.len()
-            )];
+            let mut lines = vec![format!("SHOWING {}-{} OF {}", start + 1, end, games.len())];
             lines.extend(
                 games[start..end]
-                .iter()
-                .enumerate()
-                .map(|(offset, (cart, _))| {
-                    let index = start + offset;
-                    let name = cart.name.as_deref().unwrap_or(&cart.id);
-                    let line = if index == *selection {
-                        format!("> {name}")
-                    } else {
-                        format!("  {name}")
-                    };
-                    fit_overlay_text(&line, font, font_size, text_max_width)
-                }),
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (cart, _))| {
+                        let index = start + offset;
+                        let name = cart.name.as_deref().unwrap_or(&cart.id);
+                        let line = if index == *selection {
+                            format!("> {name}")
+                        } else {
+                            format!("  {name}")
+                        };
+                        fit_overlay_text(&line, font, font_size, text_max_width)
+                    }),
             );
             lines.push("A INSTALL   B CANCEL".to_string());
             ("INSTALL FROM MEDIA", lines)
@@ -2025,12 +2038,7 @@ fn draw_mode_overlay(
                 break;
             }
             let fraction = segment as f32 / (segments - 1) as f32;
-            let color = Color::new(
-                0.10 + 0.85 * fraction,
-                0.90 - 0.55 * fraction,
-                1.0,
-                1.0,
-            );
+            let color = Color::new(0.10 + 0.85 * fraction, 0.90 - 0.55 * fraction, 1.0, 1.0);
             draw_rectangle(
                 bar_x + 3.0 * scale_factor + start,
                 bar_y + 3.0 * scale_factor,

@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+set -u
+
+CONFIG=/var/kazeta/user-data/kazeta-plus/config.toml
+THEMES=/var/kazeta/user-data/kazeta-plus/themes
+MARKER=${XDG_RUNTIME_DIR:-/tmp}/playfusion-theme-splash-played
+
+# Exit status is a contract with kazeta-bios:
+#   0 = theme splash played (or already played this boot); skip native splash
+#   2 = no usable theme splash; show the native PlayFusion fallback
+# Only one boot splash is shown per login/boot. Returning from a game must be
+# immediate and must never replay a ten-second theme animation.
+test -e "$MARKER" && exit 0
+test -r "$CONFIG" || exit 2
+
+enabled=$(sed -n 's/^show_splash_screen[[:space:]]*=[[:space:]]*\(true\|false\).*/\1/p' \
+    "$CONFIG" | head -n 1)
+test "$enabled" = true || exit 2
+
+theme=$(sed -n 's/^theme[[:space:]]*=[[:space:]]*"\([A-Za-z0-9._-]*\)".*/\1/p' \
+    "$CONFIG" | head -n 1)
+case "$theme" in
+    ''|.|..) exit 2 ;;
+esac
+
+theme_dir="$THEMES/$theme"
+theme_config="$theme_dir/theme.toml"
+test -r "$theme_config" || exit 2
+
+animation=$(sed -n 's/^boot_animation[[:space:]]*=[[:space:]]*"\([A-Za-z0-9._-]*\)".*/\1/p' \
+    "$theme_config" | head -n 1)
+case "$animation" in
+    ''|.|..|*/*|*\\*) exit 2 ;;
+esac
+video="$theme_dir/$animation"
+test -f "$video" -a -r "$video" || exit 2
+
+# Themes are untrusted removable-media content until validated. Keep the
+# accepted format deliberately narrow and cap both size and playback time.
+size=$(stat -c %s "$video" 2>/dev/null || printf 0)
+test "$size" -gt 0 -a "$size" -le 67108864 || exit 2
+codec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name \
+    -of default=nw=1:nk=1 "$video" 2>/dev/null | head -n 1)
+width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width \
+    -of default=nw=1:nk=1 "$video" 2>/dev/null | head -n 1)
+height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height \
+    -of default=nw=1:nk=1 "$video" 2>/dev/null | head -n 1)
+duration=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 \
+    "$video" 2>/dev/null | head -n 1)
+test "$codec" = h264 || exit 2
+test "${width:-0}" -gt 0 -a "$width" -le 1920 || exit 2
+test "${height:-0}" -gt 0 -a "$height" -le 1080 || exit 2
+awk -v duration="${duration:-0}" 'BEGIN { exit !(duration > 0 && duration <= 15.0) }' || exit 2
+
+# MPV failure is non-fatal and returns 2 so kazeta-bios immediately draws the
+# built-in PlayFusion splash instead.
+if timeout --signal=TERM --kill-after=2 16 \
+    mpv --no-config --really-quiet --fs --no-osc \
+        --no-input-default-bindings --keep-open=no --audio-display=no \
+        --audio-channels=auto-safe --vo=gpu --gpu-api=opengl \
+        --hwdec=vaapi-copy --video-sync=display-resample \
+        --interpolation=no --scale=bilinear --cscale=bilinear \
+        --dscale=bilinear --correct-downscaling=no \
+        --linear-downscaling=no --sigmoid-upscaling=no --deband=no \
+        -- "$video"; then
+    : > "$MARKER"
+    exit 0
+fi
+exit 2

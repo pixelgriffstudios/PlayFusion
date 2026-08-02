@@ -165,7 +165,8 @@ impl MediaPlayerState {
         } else {
             format!("{sink}.monitor")
         };
-        let Ok(config_path) = CString::new("/home/gamer/.projectM/config.inp") else {
+        let Ok(config_path) = CString::new("/var/kazeta/state/projectm-home/.projectM/config.inp")
+        else {
             return;
         };
         let Ok(monitor) = CString::new(monitor) else {
@@ -176,20 +177,15 @@ impl MediaPlayerState {
 
         unsafe {
             macroquad::window::get_internal_gl().flush();
-            self.projectm_native = playfusion_projectm_create(
-                config_path.as_ptr(),
-                monitor.as_ptr(),
-                width,
-                height,
-            );
+            self.projectm_native =
+                playfusion_projectm_create(config_path.as_ptr(), monitor.as_ptr(), width, height);
             if !self.projectm_native.is_null() {
                 let raw_texture = playfusion_projectm_texture(self.projectm_native);
                 if raw_texture != 0 {
                     let texture_id = macroquad::miniquad::TextureId::from_raw_id(
                         macroquad::miniquad::RawId::OpenGl(raw_texture),
                     );
-                    self.projectm_texture =
-                        Some(Texture2D::from_miniquad_texture(texture_id));
+                    self.projectm_texture = Some(Texture2D::from_miniquad_texture(texture_id));
                 }
             }
             macroquad::window::get_internal_gl().flush();
@@ -389,10 +385,7 @@ impl MediaPlayerState {
                     band.y * cabinet_scale_y,
                     WHITE,
                     DrawTextureParams {
-                        dest_size: Some(vec2(
-                            band.w * cabinet_scale_x,
-                            band.h * cabinet_scale_y,
-                        )),
+                        dest_size: Some(vec2(band.w * cabinet_scale_x, band.h * cabinet_scale_y)),
                         source: Some(source),
                         ..Default::default()
                     },

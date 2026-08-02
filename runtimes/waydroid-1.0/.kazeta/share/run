@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec_pointer=${1:-}
+[[ -n "$exec_pointer" ]] || {
+    echo "PlayFusion Android runtime: no APK was supplied." >&2
+    exit 2
+}
+
+payload=$exec_pointer
+if [[ -f "$exec_pointer" ]]; then
+    IFS= read -r payload < "$exec_pointer" || true
+fi
+[[ -n "$payload" ]] || {
+    echo "PlayFusion Android runtime: cartridge executable pointer is empty." >&2
+    exit 2
+}
+if [[ "$payload" != /* ]]; then
+    payload="$PWD/$payload"
+fi
+
+exec /usr/bin/playfusion-waydroid-launch "$payload"

@@ -18,9 +18,9 @@ const MAX_PROFILES: usize = 4;
 const PROFILE_IDS: [&str; 4] = ["default", "profile-1", "profile-2", "profile-3"];
 const KEYBOARD_COLUMNS: usize = 10;
 const KEYBOARD_KEYS: [&str; 39] = [
-    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q",
-    "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7",
-    "8", "9", "SPACE", "BACK", "DONE",
+    "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S",
+    "T", "U", "V", "W", "X", "Y", "Z", "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "SPACE",
+    "BACK", "DONE",
 ];
 
 const AVATAR_BYTES: [&[u8]; 40] = [
@@ -159,6 +159,80 @@ impl ProfilesState {
         self.profiles.len() > 1
     }
 
+    pub fn draw_active_badge(
+        &self,
+        font_cache: &HashMap<String, Font>,
+        config: &Config,
+        animation_state: &AnimationState,
+        scale_factor: f32,
+    ) {
+        let Some(profile) = self
+            .profiles
+            .iter()
+            .find(|profile| profile.id == self.active_id)
+        else {
+            return;
+        };
+
+        let width = 138.0 * scale_factor;
+        let height = 48.0 * scale_factor;
+        let margin = 12.0 * scale_factor;
+        let x = if config.profile_badge_position.eq_ignore_ascii_case("LEFT") {
+            margin
+        } else {
+            screen_width() - width - margin
+        };
+        let y = margin;
+        draw_rectangle(x, y, width, height, Color::new(0.01, 0.015, 0.05, 0.88));
+        // The active-profile badge is part of the selected theme. Use the
+        // theme's configured highlight instead of a fixed PlayFusion rainbow
+        // frame (the Xbox themes use their yellow selection color here).
+        draw_configured_cursor_frame(
+            config,
+            animation_state,
+            x,
+            y,
+            width,
+            height,
+            1.5 * scale_factor,
+        );
+
+        let avatar_size = 36.0 * scale_factor;
+        draw_texture_ex(
+            &self.avatars[profile.avatar % self.avatars.len()],
+            x + 6.0 * scale_factor,
+            y + 6.0 * scale_factor,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(avatar_size, avatar_size)),
+                ..Default::default()
+            },
+        );
+
+        let maximum_chars = 17;
+        let mut name = profile.name.chars().take(maximum_chars).collect::<String>();
+        if profile.name.chars().count() > maximum_chars {
+            name.push_str("...");
+        }
+        let text_x = x + 49.0 * scale_factor;
+        text_with_config_color(
+            font_cache,
+            config,
+            "ACTIVE PROFILE",
+            text_x,
+            y + 18.0 * scale_factor,
+            (6.5 * scale_factor).max(7.0) as u16,
+        );
+        text_with_config_color(
+            font_cache,
+            config,
+            &name.to_uppercase(),
+            text_x,
+            y + 34.0 * scale_factor,
+            (8.5 * scale_factor).max(8.0) as u16,
+        );
+    }
+
     pub fn open_boot(&mut self) {
         self.mode = ProfileScreenMode::Boot;
         self.selection = self
@@ -211,21 +285,25 @@ impl ProfilesState {
         };
         save_profile(&record).map_err(|error| format!("PROFILE SAVE FAILED: {error}"))?;
         self.profiles.push(record);
-        self.profiles.sort_by_key(|profile| profile_slot(&profile.id));
+        self.profiles
+            .sort_by_key(|profile| profile_slot(&profile.id));
         self.selection = self
             .profiles
             .iter()
             .position(|profile| profile.id == *id)
             .unwrap_or(0);
-        Ok(format!("{} CREATED", default_profile_name(slot).to_uppercase()))
+        Ok(format!(
+            "{} CREATED",
+            default_profile_name(slot).to_uppercase()
+        ))
     }
 
     fn cycle_avatar(&mut self, direction: isize) -> bool {
         let Some(profile) = self.profiles.get_mut(self.selection) else {
             return false;
         };
-        profile.avatar = (profile.avatar as isize + direction)
-            .rem_euclid(AVATAR_BYTES.len() as isize) as usize;
+        profile.avatar =
+            (profile.avatar as isize + direction).rem_euclid(AVATAR_BYTES.len() as isize) as usize;
         save_profile(profile).is_ok()
     }
 
@@ -282,7 +360,10 @@ impl ProfilesState {
         }
         self.profiles.retain(|item| item.id != profile.id);
         self.selection = self.selection.min(self.profiles.len().saturating_sub(1));
-        Ok(format!("{} REMOVED — SAVES ARCHIVED", profile.name.to_uppercase()))
+        Ok(format!(
+            "{} REMOVED — SAVES ARCHIVED",
+            profile.name.to_uppercase()
+        ))
     }
 
     pub fn handle_input(&mut self, input: &InputState) -> ProfileEvent {
@@ -309,7 +390,8 @@ impl ProfilesState {
                 }
             }
             ProfileScreenMode::Manage => {
-                let item_count = self.profiles.len() + usize::from(self.profiles.len() < MAX_PROFILES);
+                let item_count =
+                    self.profiles.len() + usize::from(self.profiles.len() < MAX_PROFILES);
                 if input.up || input.left {
                     self.selection = if self.selection == 0 {
                         item_count.saturating_sub(1)
@@ -498,7 +580,10 @@ fn profile_save_dir(id: &str) -> PathBuf {
 }
 
 fn profile_slot(id: &str) -> usize {
-    PROFILE_IDS.iter().position(|candidate| *candidate == id).unwrap_or(99)
+    PROFILE_IDS
+        .iter()
+        .position(|candidate| *candidate == id)
+        .unwrap_or(99)
 }
 
 fn default_profile_name(slot: usize) -> String {
@@ -588,7 +673,9 @@ pub fn draw(
     );
 
     match state.mode {
-        ProfileScreenMode::Rename => draw_rename(state, animation_state, font_cache, config, scale_factor),
+        ProfileScreenMode::Rename => {
+            draw_rename(state, animation_state, font_cache, config, scale_factor)
+        }
         ProfileScreenMode::ConfirmDelete => {
             draw_cards(state, animation_state, font_cache, config, scale_factor);
             draw_dialog(
@@ -601,13 +688,7 @@ pub fn draw(
         }
         ProfileScreenMode::Message(ref message) => {
             draw_cards(state, animation_state, font_cache, config, scale_factor);
-            draw_dialog(
-                font_cache,
-                config,
-                "USER PROFILES",
-                message,
-                scale_factor,
-            );
+            draw_dialog(font_cache, config, "USER PROFILES", message, scale_factor);
         }
         _ => draw_cards(state, animation_state, font_cache, config, scale_factor),
     }
@@ -645,7 +726,13 @@ fn draw_cards(
 
     for index in 0..count {
         let x = start_x + index as f32 * (card_width + gap);
-        draw_rectangle(x, y, card_width, card_height, Color::new(0.01, 0.015, 0.05, 0.94));
+        draw_rectangle(
+            x,
+            y,
+            card_width,
+            card_height,
+            Color::new(0.01, 0.015, 0.05, 0.94),
+        );
         draw_playfusion_panel_frame(x, y, card_width, card_height, 2.0 * scale_factor, 0.62);
         if index == state.selection {
             draw_configured_cursor_frame(
@@ -776,8 +863,7 @@ fn draw_rename(
     let key_width = 46.0 * scale_factor;
     let key_height = 28.0 * scale_factor;
     let gap = 3.0 * scale_factor;
-    let keyboard_width = KEYBOARD_COLUMNS as f32 * key_width
-        + (KEYBOARD_COLUMNS - 1) as f32 * gap;
+    let keyboard_width = KEYBOARD_COLUMNS as f32 * key_width + (KEYBOARD_COLUMNS - 1) as f32 * gap;
     let start_x = (screen_width() - keyboard_width) / 2.0;
     let start_y = 142.0 * scale_factor;
     for (index, key) in KEYBOARD_KEYS.iter().enumerate() {
@@ -785,7 +871,13 @@ fn draw_rename(
         let row = index / KEYBOARD_COLUMNS;
         let x = start_x + column as f32 * (key_width + gap);
         let y = start_y + row as f32 * (key_height + gap);
-        draw_rectangle(x, y, key_width, key_height, Color::new(0.01, 0.015, 0.05, 0.95));
+        draw_rectangle(
+            x,
+            y,
+            key_width,
+            key_height,
+            Color::new(0.01, 0.015, 0.05, 0.95),
+        );
         draw_playfusion_panel_frame(x, y, key_width, key_height, 1.0 * scale_factor, 0.42);
         if index == state.keyboard_selection {
             draw_configured_cursor_frame(

@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_ROOT=/var/lib/playfusion-updater
+BACKUP_ROOT="$STATE_ROOT/backups"
+PENDING_FILE="$STATE_ROOT/pending-health"
+PUBLIC_KEY=/etc/playfusion-update-public.pem
+CURRENT_RELEASE=/etc/playfusion-release
+LOCK_FILE=/run/playfusion-update.lock
+
+fail() {
+    printf 'ERROR: %s\n' "$*" >&2
+    exit 1
+}
+
+require_root() {
+    test "$(id -u)" -eq 0 || fail "Updater must run as root."
+}
+
+safe_relative_path() {
+    local path=${1#./}
+    path=${path%/}
+    case "$path" in
+        ''|/*|.|..|var/kazeta/*|home/*|root/*|boot/*|dev/*|proc/*|sys/*|run/*)
+            return 1
+            ;;
+        usr|etc|opt|usr/*|etc/*|opt/*)
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+    case "/$path/" in
+        *'/../'*|*'//'*) return 1 ;;
+    esac
+    case "$path" in
+        usr/bin/playfusion-update-helper|usr/bin/playfusion-update-health|etc/playfusion-update-public.pem|etc/systemd/system/playfusion-update-health.service)
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+current_version() {
+    if test -r "$CURRENT_RELEASE"; then
+        sed -n 's/^VERSION=//p' "$CURRENT_RELEASE" | head -n 1
+    else
+        printf '1.0.2\n'
+    fi
+}
+
+version_allows_update() {
+    python3 - "$1" "$2" "$3" <<'PY'
+import re
+import sys
+
+def version(value):
+    match = re.fullmatch(r"v?(\d+)\.(\d+)\.(\d+)", value.strip())
+    if not match:
+        raise SystemExit(2)
+    return tuple(map(int, match.groups()))
+
+current, minimum, target = map(version, sys.argv[1:])
+raise SystemExit(0 if current >= minimum and target > current else 1)
+PY
+}
+
+rollback_directory() {
+    local backup=$1
+    test -d "$backup" || fail "Rollback backup is missing: $backup"
+
+    if test -r "$backup/created.list"; then
+        tac "$backup/created.list" | while IFS= read -r relative; do
+            test -n "$relative" || continue
+            safe_relative_path "$relative" || continue
+            absolute="/$relative"
+            if test -L "$absolute" || test -f "$absolute"; then
+                rm -f -- "$absolute"
+            elif test -d "$absolute"; then
+                rmdir -- "$absolute" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    if test -d "$backup/root"; then
+        cp -a -- "$backup/root/." /
+    fi
+    if test -r "$backup/previous-release"; then
+        install -m 0644 "$backup/previous-release" "$CURRENT_RELEASE"
+    else
+        rm -f -- "$CURRENT_RELEASE"
+    fi
+    systemctl daemon-reload || true
+    rm -f -- "$PENDING_FILE"
+    printf 'Rollback restored %s\n' "$backup"
+}
+
+install_update() {
+    local package=${1:?Missing .pfu package}
+    local checksum_file=${2:?Missing checksum file}
+    local signature=${3:?Missing signature file}
+
+    test -f "$package" -a -f "$checksum_file" -a -f "$signature" || fail "Update files are incomplete."
+    test -r "$PUBLIC_KEY" || fail "PlayFusion update public key is missing."
+    test ! -e "$PENDING_FILE" || fail "A previous update is still awaiting a successful boot."
+
+    local size
+    size=$(stat -c %s "$package")
+    test "$size" -gt 0 -a "$size" -le 1073741824 || fail "Update package size is invalid."
+
+    local expected actual
+    expected=$(awk 'NR == 1 { print tolower($1) }' "$checksum_file")
+    case "$expected" in
+        *[!0-9a-f]*|'') fail "Checksum file is malformed." ;;
+    esac
+    test "${#expected}" -eq 64 || fail "Checksum file is malformed."
+    actual=$(sha256sum "$package" | awk '{ print $1 }')
+    test "$actual" = "$expected" || fail "SHA-256 verification failed."
+    openssl dgst -sha256 -verify "$PUBLIC_KEY" -signature "$signature" "$package" >/dev/null \
+        || fail "PlayFusion signature verification failed."
+
+    local stage
+    stage=$(mktemp -d /var/tmp/playfusion-update.XXXXXX)
+    trap 'rm -rf -- "${stage:-}"' EXIT
+
+    # The signed outer package deliberately contains only these files.
+    while IFS= read -r entry; do
+        entry=${entry#./}
+        case "$entry" in
+            manifest.toml|payload.tar.zst|delete.list|post-install|'') ;;
+            *) fail "Unexpected package member: $entry" ;;
+        esac
+    done < <(bsdtar -tf "$package")
+    bsdtar --no-same-owner -xf "$package" -C "$stage"
+    test -f "$stage/manifest.toml" -a -f "$stage/payload.tar.zst" || fail "Package manifest or payload is missing."
+
+    local metadata product format target minimum restart payload_hash
+    metadata=$(python3 - "$stage/manifest.toml" <<'PY'
+import sys
+import tomllib
+with open(sys.argv[1], "rb") as handle:
+    data = tomllib.load(handle)
+for key in ("product", "format", "version", "minimum_version", "restart", "payload_sha256"):
+    print(data.get(key, ""))
+PY
+)
+    mapfile -t fields <<<"$metadata"
+    product=${fields[0]:-}
+    format=${fields[1]:-}
+    target=${fields[2]:-}
+    minimum=${fields[3]:-}
+    restart=${fields[4]:-}
+    payload_hash=${fields[5]:-}
+    test "$product" = PlayFusion || fail "Package is not a PlayFusion update."
+    test "$format" = 1 || fail "Unsupported update-package format."
+    test "$restart" = reboot || fail "Unsupported restart policy."
+    test "$payload_hash" = "$(sha256sum "$stage/payload.tar.zst" | awk '{ print $1 }')" \
+        || fail "Payload hash verification failed."
+
+    local current
+    current=$(current_version)
+    version_allows_update "$current" "$minimum" "$target" \
+        || fail "Update $target does not support installed version $current."
+
+    mkdir -p "$stage/root"
+    while IFS= read -r relative; do
+        relative=${relative#./}
+        test -z "$relative" && continue
+        safe_relative_path "$relative" || fail "Unsafe payload path: $relative"
+    done < <(bsdtar -tf "$stage/payload.tar.zst")
+    bsdtar --no-same-owner -xf "$stage/payload.tar.zst" -C "$stage/root"
+
+    while IFS= read -r -d '' link; do
+        target_link=$(readlink "$link")
+        case "$target_link" in
+            /*|../*|*/../*|*/..) fail "Unsafe symbolic link in update payload." ;;
+        esac
+    done < <(find "$stage/root" -type l -print0)
+
+    if test -f "$stage/post-install"; then
+        head -n 1 "$stage/post-install" | grep -Eq '^#![[:space:]]*(/usr/bin/env[[:space:]]+(ba)?sh|/(usr/)?bin/(ba)?sh)$' \
+            || fail "post-install must be a shell script."
+        bash -n "$stage/post-install" || fail "post-install contains a syntax error."
+    fi
+
+    if command -v frzr-unlock >/dev/null 2>&1; then
+        frzr-unlock >/dev/null 2>&1 || fail "Unable to unlock the system deployment."
+    fi
+
+    local backup="$BACKUP_ROOT/${current}_to_${target}_$(date +%Y%m%dT%H%M%S)"
+    mkdir -p "$backup/root"
+    test -r "$CURRENT_RELEASE" && cp -a "$CURRENT_RELEASE" "$backup/previous-release"
+    : > "$backup/created.list"
+
+    # Back up every destination before changing it. Newly created paths are
+    # recorded separately so rollback removes only those exact paths.
+    while IFS= read -r -d '' source; do
+        relative=${source#"$stage/root/"}
+        absolute="/$relative"
+        if test -e "$absolute" || test -L "$absolute"; then
+            cp -a --parents -- "$absolute" "$backup/root"
+        else
+            printf '%s\n' "$relative" >> "$backup/created.list"
+        fi
+    done < <(find "$stage/root" -mindepth 1 \( -type f -o -type l \) -print0)
+    while IFS= read -r -d '' directory; do
+        relative=${directory#"$stage/root/"}
+        test -d "/$relative" || printf '%s\n' "$relative" >> "$backup/created.list"
+    done < <(find "$stage/root" -mindepth 1 -type d -print0)
+
+    if test -f "$stage/delete.list"; then
+        while IFS= read -r relative; do
+            relative=${relative#./}
+            test -z "$relative" && continue
+            safe_relative_path "$relative" || fail "Unsafe delete path: $relative"
+            absolute="/$relative"
+            if test -e "$absolute" || test -L "$absolute"; then
+                cp -a --parents -- "$absolute" "$backup/root"
+            fi
+        done < "$stage/delete.list"
+    fi
+
+    # From this point on, any failure restores the exact pre-update files.
+    set +e
+    cp -a -- "$stage/root/." /
+    apply_status=$?
+    if test "$apply_status" -eq 0 && test -f "$stage/delete.list"; then
+        while IFS= read -r relative; do
+            relative=${relative#./}
+            test -z "$relative" && continue
+            absolute="/$relative"
+            if test -L "$absolute" || test -f "$absolute"; then
+                rm -f -- "$absolute" || apply_status=1
+            elif test -d "$absolute"; then
+                rmdir -- "$absolute" 2>/dev/null || apply_status=1
+            fi
+        done < "$stage/delete.list"
+    fi
+    if test "$apply_status" -eq 0 && test -f "$stage/post-install"; then
+        PLAYFUSION_FROM_VERSION="$current" PLAYFUSION_TO_VERSION="$target" \
+            bash "$stage/post-install" || apply_status=1
+    fi
+    if test "$apply_status" -eq 0; then
+        printf 'PRODUCT=PlayFusion\nVERSION=%s\n' "$target" > "$CURRENT_RELEASE"
+        systemctl daemon-reload || apply_status=1
+    fi
+    set -e
+    if test "$apply_status" -ne 0; then
+        rollback_directory "$backup"
+        fail "Update failed and was rolled back."
+    fi
+
+    mkdir -p "$STATE_ROOT"
+    printf 'BACKUP=%s\nFROM=%s\nTO=%s\n' "$backup" "$current" "$target" > "$PENDING_FILE"
+    sync
+    printf 'Update %s installed and awaiting reboot health check.\n' "$target"
+}
+
+confirm_health() {
+    test -r "$PENDING_FILE" || exit 0
+    local backup
+    backup=$(sed -n 's/^BACKUP=//p' "$PENDING_FILE" | head -n 1)
+    test -d "$backup" || fail "Pending backup is missing."
+    rm -f -- "$PENDING_FILE"
+    printf 'PlayFusion boot health confirmed. Rollback retained at %s\n' "$backup"
+}
+
+rollback_pending() {
+    test -r "$PENDING_FILE" || fail "No pending update exists."
+    local backup
+    backup=$(sed -n 's/^BACKUP=//p' "$PENDING_FILE" | head -n 1)
+    rollback_directory "$backup"
+}
+
+require_root
+mkdir -p "$STATE_ROOT" "$BACKUP_ROOT"
+exec 9>"$LOCK_FILE"
+flock -n 9 || fail "Another PlayFusion update is already running."
+
+case "${1:-}" in
+    install) shift; install_update "$@" ;;
+    confirm-health) confirm_health ;;
+    rollback-pending) rollback_pending ;;
+    current-version) current_version ;;
+    *) fail "Usage: playfusion-update-helper {install PACKAGE SHA256 SIGNATURE|confirm-health|rollback-pending|current-version}" ;;
+esac

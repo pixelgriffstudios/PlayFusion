@@ -1,0 +1,12 @@
+[Unit]
+Description=PlayFusion update boot health and automatic rollback
+After=graphical.target
+ConditionPathExists=/var/lib/playfusion-updater/pending-health
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/playfusion-update-health
+TimeoutStartSec=120
+
+[Install]
+WantedBy=graphical.target

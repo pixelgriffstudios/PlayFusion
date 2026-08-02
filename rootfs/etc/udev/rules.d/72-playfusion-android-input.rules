@@ -1,0 +1,5 @@
+# Allow the unprivileged PlayFusion game session to consume the virtual
+# keyboard and pointer devices used by Android touch-mode carts.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="PlayFusion Android Touch Pointer", OWNER="gamer", GROUP="input", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="keyd virtual keyboard", OWNER="gamer", GROUP="input", MODE="0660"
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{name}=="InputPlumber Keyboard", OWNER="gamer", GROUP="input", MODE="0660"

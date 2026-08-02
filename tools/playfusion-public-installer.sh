@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS_NAME="PlayFusion 1.0"
+OS_NAME="PlayFusion 1.0.2"
 MIN_DISK_SIZE=28
 MOUNT_PATH=/tmp/frzr_root
 SEED_ARCHIVE=/root/playfusion-seed.tar
@@ -209,6 +209,14 @@ done < <(find "${MOUNT_PATH}/var/kazeta/internal-games" \
 
 test "$(find "${MOUNT_PATH}/var/kazeta/internal-games" -mindepth 2 -maxdepth 2 -type d | wc -l)" -eq 2 || \
     fail_install "The public game library failed validation."
+test "$(find "${DEPLOYMENT}/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39 || \
+    fail_install "The bundled runtime library failed validation."
+test "$(find "${MOUNT_PATH}/var/kazeta/user-data/kazeta-plus/themes" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 || \
+    fail_install "The factory theme library failed validation."
+grep -qx 'VERSION=1.0.2' "${DEPLOYMENT}/etc/playfusion-release" || \
+    fail_install "The installed PlayFusion version is incorrect."
+test -x "${DEPLOYMENT}/usr/bin/playfusion-update-helper" || \
+    fail_install "The signed update helper is missing."
 test "$(stat -c '%u:%g' "${MOUNT_PATH}/var/kazeta")" = 1000:1000 || \
     fail_install "Factory data ownership validation failed."
 test "$(stat -c '%u:%g' "${MOUNT_PATH}/var/kazeta/saves/default")" = 1000:1000 || \
@@ -217,10 +225,10 @@ test "$(stat -c '%u:%g' "${MOUNT_PATH}/var/kazeta/saves/default")" = 1000:1000 |
 printf '%s\n' 'playfusion/local' > "${MOUNT_PATH}/source"
 sync
 
-MESSAGE="PlayFusion 1.0 installed successfully.
+MESSAGE="PlayFusion 1.0.2 installed successfully.
 
 Included:
-  - All 38 system runtimes
+  - All 39 system runtimes
   - Hell on Rails
   - PlayFusion Arcade
   - 30 years music album

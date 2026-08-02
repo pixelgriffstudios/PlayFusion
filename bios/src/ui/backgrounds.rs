@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 
 pub const PROCEDURAL_BACKGROUNDS: &[&str] = &[
     "Retro Laser Grid",
+    "Xbox 2.0",
     "Cartridge Energy Core",
     "Neon Console Interior",
     "Retro Maze",
@@ -57,6 +58,7 @@ pub fn draw(name: &str, state: &mut BackgroundState) {
             );
         }
         "Retro Laser Grid" => draw_laser_grid(state),
+        "Xbox 2.0" => draw_xbox_2_0(state),
         "Prismatic Space Tunnel" => draw_space_tunnel(state),
         "Console Generations" => draw_console_generations(state),
         "Lava Lamp Plasma" => draw_lava_lamp(state),
@@ -82,6 +84,7 @@ fn draw_dark_theme_visibility_lift(name: &str, state: &BackgroundState) {
         "Prismatic Space Tunnel" => Some(Color::new(0.35, 0.08, 0.68, 0.070)),
         "Console Generations" => Some(Color::new(0.18, 0.12, 0.62, 0.060)),
         "Digital Circuit Rain" => Some(Color::new(0.00, 0.45, 0.38, 0.060)),
+        "Xbox 2.0" => Some(Color::new(0.02, 0.55, 0.18, 0.055)),
         _ => None,
     };
     let Some(tint) = tint else {
@@ -151,10 +154,7 @@ fn refresh_internal_game_covers(state: &mut BackgroundState) {
                         .unwrap_or_default()
                         .to_ascii_lowercase();
                     if stem.contains("cover")
-                        && matches!(
-                            extension.as_str(),
-                            "png" | "jpg" | "jpeg" | "webp" | "avif"
-                        )
+                        && matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp" | "avif")
                     {
                         candidates.push(path);
                     }
@@ -567,7 +567,13 @@ fn draw_laser_grid(state: &BackgroundState) {
                 lerp(0.105, 0.245, mix),
             )
         };
-        draw_rectangle(0.0, y, width, band_height, Color::new(red, green, blue, 1.0));
+        draw_rectangle(
+            0.0,
+            y,
+            width,
+            band_height,
+            Color::new(red, green, blue, 1.0),
+        );
     }
 
     // Wide magenta/violet horizon bloom.
@@ -598,13 +604,13 @@ fn draw_laser_grid(state: &BackgroundState) {
         } else {
             Color::new(0.78, 0.88, 1.0, twinkle)
         };
-        draw_circle(x, y, radius * 3.5, Color::new(star_color.r, star_color.g, star_color.b, twinkle * 0.05));
         draw_circle(
             x,
             y,
-            radius,
-            star_color,
+            radius * 3.5,
+            Color::new(star_color.r, star_color.g, star_color.b, twinkle * 0.05),
         );
+        draw_circle(x, y, radius, star_color);
     }
 
     // Sunset disc with layered glow and expanding dark scan gaps.
@@ -688,8 +694,22 @@ fn draw_laser_grid(state: &BackgroundState) {
                 vec2(right_x, base_y),
                 fill,
             );
-            draw_line(left_x, base_y, peak_x, peak_y, 7.0, Color::new(edge.r, edge.g, edge.b, 0.035));
-            draw_line(peak_x, peak_y, right_x, base_y, 7.0, Color::new(edge.r, edge.g, edge.b, 0.035));
+            draw_line(
+                left_x,
+                base_y,
+                peak_x,
+                peak_y,
+                7.0,
+                Color::new(edge.r, edge.g, edge.b, 0.035),
+            );
+            draw_line(
+                peak_x,
+                peak_y,
+                right_x,
+                base_y,
+                7.0,
+                Color::new(edge.r, edge.g, edge.b, 0.035),
+            );
             draw_line(left_x, base_y, peak_x, peak_y, 1.4, edge);
             draw_line(peak_x, peak_y, right_x, base_y, 1.4, edge);
         }
@@ -717,7 +737,11 @@ fn draw_laser_grid(state: &BackgroundState) {
     for line in -18..=18 {
         let spread = line as f32 / 18.0;
         let bottom_x = width * 0.5 + spread * width * 1.08;
-        let color = hue(((line + 18) as f32 / 37.0 + time * 0.018).fract(), 0.86, 1.0);
+        let color = hue(
+            ((line + 18) as f32 / 37.0 + time * 0.018).fract(),
+            0.86,
+            1.0,
+        );
         draw_line(
             width * 0.5,
             horizon,
@@ -743,18 +767,50 @@ fn draw_laser_grid(state: &BackgroundState) {
         let y = horizon + perspective * (height - horizon);
         let color = hue((line as f32 * 0.047 + time * 0.026).fract(), 0.86, 1.0);
         let alpha = 0.22 + perspective * 0.64;
-        draw_line(0.0, y, width, y, 8.0 + perspective * 5.0, Color::new(color.r, color.g, color.b, alpha * 0.055));
-        draw_line(0.0, y, width, y, 1.0 + perspective * 1.3, Color::new(color.r, color.g, color.b, alpha));
+        draw_line(
+            0.0,
+            y,
+            width,
+            y,
+            8.0 + perspective * 5.0,
+            Color::new(color.r, color.g, color.b, alpha * 0.055),
+        );
+        draw_line(
+            0.0,
+            y,
+            width,
+            y,
+            1.0 + perspective * 1.3,
+            Color::new(color.r, color.g, color.b, alpha),
+        );
     }
 
     // Multicolor horizon bloom.
     for segment in 0..72 {
         let x0 = segment as f32 / 72.0 * width;
         let x1 = (segment + 1) as f32 / 72.0 * width;
-        let color = hue((segment as f32 / 72.0 * 0.72 + time * 0.018).fract(), 0.82, 1.0);
+        let color = hue(
+            (segment as f32 / 72.0 * 0.72 + time * 0.018).fract(),
+            0.82,
+            1.0,
+        );
         let center_fade = 1.0 - ((segment as f32 / 71.0 - 0.5).abs() * 2.0).powf(1.8);
-        draw_line(x0, horizon, x1, horizon, 11.0, Color::new(color.r, color.g, color.b, center_fade * 0.055));
-        draw_line(x0, horizon, x1, horizon, 2.0, Color::new(color.r, color.g, color.b, center_fade * 0.76));
+        draw_line(
+            x0,
+            horizon,
+            x1,
+            horizon,
+            11.0,
+            Color::new(color.r, color.g, color.b, center_fade * 0.055),
+        );
+        draw_line(
+            x0,
+            horizon,
+            x1,
+            horizon,
+            2.0,
+            Color::new(color.r, color.g, color.b, center_fade * 0.76),
+        );
     }
 
     // Fast sparks along the outer lanes make the floor feel alive.
@@ -1409,6 +1465,129 @@ fn draw_cover(covers: &[Texture2D], index: usize, rect: Rect, alpha: f32) {
                 ..Default::default()
             },
         );
+    }
+}
+
+/// A lightweight, resolution-independent dashboard animation inspired by the
+/// green translucent geometry of early-2000s console interfaces. It uses only
+/// native Macroquad primitives, avoiding video decoding entirely.
+fn draw_xbox_2_0(state: &BackgroundState) {
+    let width = screen_width();
+    let height = screen_height();
+    let time = state.procedural_time;
+    clear_background(Color::from_rgba(0, 8, 3, 255));
+
+    // Slow liquid-green depth bands.
+    for layer in 0..18 {
+        let depth = layer as f32 / 18.0;
+        let wave = (time * (0.34 + depth * 0.22) + layer as f32 * 0.61).sin();
+        let y = height * (0.08 + depth * 0.88) + wave * height * 0.018;
+        let alpha = 0.018 + depth * 0.030;
+        draw_rectangle(
+            0.0,
+            y,
+            width,
+            height * (0.035 + depth * 0.018),
+            Color::new(0.0, 0.60, 0.17, alpha),
+        );
+    }
+
+    // Large translucent X blades converge around an animated energy core.
+    let core = vec2(width * 0.42, height * 0.48);
+    let reach = width.max(height) * 0.72;
+    let blade_width = height * (0.10 + (time * 0.65).sin() * 0.012);
+    let blade_color = Color::new(0.02, 0.78, 0.20, 0.105);
+    for direction in [-1.0_f32, 1.0] {
+        let end_top = vec2(core.x + direction * reach, core.y - reach * 0.58);
+        let end_bottom = vec2(core.x + direction * reach, core.y + reach * 0.58);
+        draw_triangle(
+            core + vec2(-blade_width, 0.0),
+            end_top,
+            core + vec2(blade_width, 0.0),
+            blade_color,
+        );
+        draw_triangle(
+            core + vec2(-blade_width, 0.0),
+            end_bottom,
+            core + vec2(blade_width, 0.0),
+            blade_color,
+        );
+    }
+
+    // Layered core rings and rotating spokes.
+    let pulse = 1.0 + (time * 1.25).sin() * 0.055;
+    for ring in (1..=12).rev() {
+        let fraction = ring as f32 / 12.0;
+        let radius = height * 0.23 * fraction * pulse;
+        draw_circle(
+            core.x,
+            core.y,
+            radius,
+            Color::new(0.0, 0.48 + fraction * 0.35, 0.12, 0.018 + fraction * 0.012),
+        );
+    }
+    for spoke in 0..12 {
+        let angle = time * 0.16 + spoke as f32 * std::f32::consts::TAU / 12.0;
+        let inner = height * 0.075;
+        let outer = height * (0.20 + 0.018 * (time * 0.8 + spoke as f32).sin());
+        draw_line(
+            core.x + angle.cos() * inner,
+            core.y + angle.sin() * inner,
+            core.x + angle.cos() * outer,
+            core.y + angle.sin() * outer,
+            (1.0 + height / 540.0).max(1.0),
+            Color::new(0.28, 1.0, 0.46, 0.24),
+        );
+    }
+    draw_circle(
+        core.x,
+        core.y,
+        height * 0.058 * pulse,
+        Color::new(0.16, 1.0, 0.34, 0.72),
+    );
+    draw_circle(
+        core.x,
+        core.y,
+        height * 0.031 * pulse,
+        Color::new(0.75, 1.0, 0.79, 0.88),
+    );
+
+    // Perspective floor grid gives the dashboard a stable horizon at any
+    // resolution while leaving the right-side menu area readable.
+    let horizon = height * 0.76;
+    for line in 0..18 {
+        let fraction = line as f32 / 17.0;
+        let eased = fraction * fraction;
+        let y = horizon + eased * (height - horizon);
+        draw_line(0.0, y, width, y, 1.0, Color::new(0.05, 0.92, 0.28, 0.12));
+    }
+    for line in -16..=16 {
+        let bottom_x = width * 0.5 + line as f32 * width / 14.0;
+        draw_line(
+            core.x,
+            horizon,
+            bottom_x,
+            height,
+            1.0,
+            Color::new(0.02, 0.86, 0.24, 0.11),
+        );
+    }
+
+    // Deterministic floating particles; no per-frame allocations or RNG.
+    for particle in 0..34 {
+        let seed = hash(particle as f32 * 7.19);
+        let x = (seed * width + time * (6.0 + seed * 11.0)) % width;
+        let y = hash(particle as f32 * 3.73 + 9.0) * height;
+        let glow = 0.25 + 0.55 * (time * 1.3 + particle as f32).sin().abs();
+        draw_circle(x, y, 0.7 + seed * 1.3, Color::new(0.16, 1.0, 0.36, glow));
+    }
+
+    // Subtle scanlines unify the look without obscuring text.
+    let spacing = (height / 180.0).max(3.0);
+    let mut y = 0.0;
+    while y < height {
+        draw_rectangle(0.0, y, width, 1.0, Color::new(0.0, 0.0, 0.0, 0.10));
+        y += spacing;
     }
 }
 

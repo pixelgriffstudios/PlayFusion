@@ -439,6 +439,11 @@ probe_by_extension() {
         wbfs) printf 'dolphin\tdolphin-1.0\twii\n' ;;
         gcm|rvz) printf 'dolphin\tdolphin-1.0\tgamecube\n' ;;
         wux|wud) printf 'wiiu\tcemu-1.0\twiiu\n' ;;
+        apk)
+            [ -z "$archive_entry" ] || return 1
+            [ "$(read_hex "$file" 0 4)" = 504b0304 ] || return 1
+            printf 'android\twaydroid-1.0\tandroid\n'
+            ;;
         cso)
             [ -n "$archive_entry" ] ||
                 [ "$(read_hex "$file" 0 4)" = 4349534f ] || return 1

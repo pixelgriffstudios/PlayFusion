@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Waydroid 1.5.x ships a placeholder LXC post-stop hook pointing at
+# /dev/null on some distributions.  LXC executes hooks, so the character
+# device returns status 126 and can leave a cartridge's cleanup incomplete.
+# /bin/true is an executable, side-effect-free replacement.
+for config in \
+    /usr/lib/waydroid/data/configs/config_base \
+    /var/lib/waydroid/lxc/waydroid/config \
+    /var/lib/waydroid/config_session; do
+    [[ -f "$config" ]] || continue
+    sed -i 's#^lxc\.hook\.post-stop[[:space:]]*=.*#lxc.hook.post-stop = /bin/true#' "$config"
+done

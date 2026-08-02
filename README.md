@@ -31,9 +31,14 @@ Before installing, review the [changelog](CHANGELOG.md) and
   PlayFusion, Kazeta+, and compatible Kazeta installations.
 - **[Runtime catalog and BIOS guide](https://github.com/pixelgriffstudios/PlayFusion-Runtimes)** — system support, installation paths, required firmware, and checksums.
 
+- **[Theme and USB theme guide](docs/themes.md)** — create, package, import,
+  apply, and reset PlayFusion or backward-compatible Kazeta+ themes.
+- **[Signed update guide](docs/updates.md)** — cumulative internet/offline
+  updates, signature verification, and automatic rollback behavior.
+
 ## Major features
 
-- 38 bundled Kazeta runtimes
+- 39 bundled Kazeta-compatible runtimes
 - PlayFusion Arcade and Hell on Rails factory games
 - System-organized Internal Games gallery and Game Manager
 - Automatic single-ROM and multi-ROM USB/SD/data-disc support
@@ -46,6 +51,7 @@ Before installing, review the [changelog](CHANGELOG.md) and
 - Controller normalization and per-system/per-game layouts
 - FTP, SSH, and SFTP maintenance access
 - Native themes, animated backgrounds, and custom screensavers
+- Signed cumulative updates with automatic rollback and boot-health checks
 
 ## Source layout
 

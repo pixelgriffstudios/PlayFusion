@@ -75,7 +75,7 @@ pub const DEV_MODE: bool = false;
 
 macro_rules! ver {
     () => {
-        "1.0"
+        "1.0.2"
     };
 } // Define the version number here
 #[cfg(feature = "dev")]
@@ -83,6 +83,7 @@ const VERSION_NUMBER: &str = concat!("PlayFusion V", ver!(), " DEV");
 
 #[cfg(not(feature = "dev"))]
 const VERSION_NUMBER: &str = concat!("PlayFusion V", ver!());
+pub const CURRENT_UPDATE_VERSION: &str = ver!();
 
 const WINDOW_TITLE: &str = "PlayFusion";
 const SCREEN_WIDTH: i32 = 640;
@@ -1170,13 +1171,31 @@ async fn main() {
         menu_maze: ui::screensaver::MazeScreensaver::new(),
     };
 
-    // PlayFusion's procedural collection replaces the legacy ribbon/image
-    // choices in Settings. The old assets remain cached as a safe fallback.
-    let background_choices: Vec<String> = ui::backgrounds::PROCEDURAL_BACKGROUNDS
+    // Keep PlayFusion's procedural collection first, then expose installed
+    // image/video backgrounds (including theme backgrounds) in the same cycle.
+    let mut background_choices: Vec<String> = ui::backgrounds::PROCEDURAL_BACKGROUNDS
         .iter()
         .map(|name| name.to_string())
         .collect();
-    if !ui::backgrounds::is_procedural_background(&config.background_selection) {
+
+    let mut installed_backgrounds: Vec<String> = background_cache
+        .keys()
+        .chain(video_cache.keys())
+        .filter(|name| name.as_str() != "Default")
+        .filter(|name| !ui::backgrounds::is_procedural_background(name))
+        .cloned()
+        .collect();
+    installed_backgrounds.sort_by_key(|name| name.to_ascii_lowercase());
+    installed_backgrounds.dedup();
+    background_choices.extend(installed_backgrounds);
+
+    // Only repair a missing selection. Previously every installed theme
+    // background was replaced with the first procedural background here.
+    let selected_background_available =
+        ui::backgrounds::is_procedural_background(&config.background_selection)
+            || background_cache.contains_key(&config.background_selection)
+            || video_cache.contains_key(&config.background_selection);
+    if !selected_background_available {
         config.background_selection = ui::backgrounds::PROCEDURAL_BACKGROUNDS[0].to_string();
         config.save();
     }
@@ -1212,8 +1231,28 @@ async fn main() {
     let mut input_state = InputState::new();
     let mut animation_state = AnimationState::new();
 
-    // SPLASH SCREEN
-    if config.show_splash_screen {
+    // A valid theme animation replaces the built-in PlayFusion splash. The
+    // helper also returns success when the splash was already shown during
+    // this boot, preventing it from replaying after a game exits.
+    let theme_splash_handled = if config.show_splash_screen {
+        if let Some(sink) = &current_bgm {
+            sink.set_volume(0.0);
+        }
+        let handled = process::Command::new("/usr/bin/playfusion-theme-splash")
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if let Some(sink) = &current_bgm {
+            sink.set_volume(config.bgm_volume);
+        }
+        handled
+    } else {
+        false
+    };
+
+    // The native cartridge animation remains the default/fallback splash for
+    // themes that do not provide a valid boot animation.
+    if config.show_splash_screen && !theme_splash_handled {
         // Mute BGM
         if let Some(sink) = &current_bgm {
             sink.set_volume(0.0);
@@ -1296,6 +1335,7 @@ async fn main() {
     let mut storage_expansion_state = ui::storage_expansion::StorageExpansionState::default();
     let mut bios_files_state = ui::bios_files::BiosFilesState::default();
     let mut controller_setup_state = ui::controller_setup::ControllerSetupState::default();
+    let mut android_controller_state = ui::android_controller::AndroidControllerState::default();
     let mut ftp_endpoint = ui::internal_games::ftp_endpoint();
     let mut next_ftp_refresh = get_time() + 5.0;
     let mut menu_screensaver = ui::screensaver::MazeScreensaver::new();
@@ -1369,6 +1409,11 @@ async fn main() {
         should_clear_dialogs: false,
         error_message: None,
     }));
+
+    // The update health service only accepts a release after the UI has
+    // loaded its configuration, media state and assets and is ready to draw.
+    // /run is recreated every boot, so stale markers cannot mask a bad boot.
+    let _ = fs::write("/run/playfusion-ui-healthy", b"ready\n");
 
     // BEGINNING OF MAIN LOOP
     loop {
@@ -1721,6 +1766,7 @@ async fn main() {
                     scale_factor,
                     flash_message.as_ref().map(|(msg, _)| msg.as_str()),
                     &ftp_endpoint,
+                    &profiles_state,
                 );
             }
             Screen::Profiles => {
@@ -1917,13 +1963,12 @@ async fn main() {
                                 .map(|value| PathBuf::from(value.trim()));
                             if let Some(source) = source {
                                 if media_library_state.start_install_path(kind, &source) {
-                                    current_screen = if kind
-                                        == ui::media_library::MediaLibraryKind::Movies
-                                    {
-                                        Screen::Movies
-                                    } else {
-                                        Screen::MusicLibrary
-                                    };
+                                    current_screen =
+                                        if kind == ui::media_library::MediaLibraryKind::Movies {
+                                            Screen::Movies
+                                        } else {
+                                            Screen::MusicLibrary
+                                        };
                                     sound_effects.play_select(&config);
                                 } else {
                                     sound_effects.play_reject(&config);
@@ -1963,8 +2008,7 @@ async fn main() {
                                 // as a normal cart would intentionally terminate kazeta-bios;
                                 // a short player error would then be misread as a failed game
                                 // and Kazeta's wrapper would power the console off.
-                                media_player_state
-                                    .prepare_file(source, Screen::GameSelection);
+                                media_player_state.prepare_file(source, Screen::GameSelection);
                                 current_screen = player_screen;
                             } else {
                                 sound_effects.play_reject(&config);
@@ -2052,6 +2096,7 @@ async fn main() {
             Screen::InternalGames | Screen::GameManager => {
                 let game_manager = current_screen == Screen::GameManager;
                 internal_games_state.manager_mode = game_manager;
+                internal_games_state.theme_name = config.theme.clone();
                 if !internal_games_state.loaded {
                     internal_games_state.refresh();
                 }
@@ -2388,7 +2433,8 @@ async fn main() {
                     &input_state,
                     &mut current_screen,
                     &sound_effects,
-                    &config,
+                    &mut config,
+                    &loaded_themes,
                 );
                 ui::theme_downloader::draw(
                     &theme_downloader_state,
@@ -2756,6 +2802,39 @@ async fn main() {
                 }
                 ui::controller_setup::draw(
                     &controller_setup_state,
+                    &animation_state,
+                    &logo_cache,
+                    &background_cache,
+                    &mut video_cache,
+                    &font_cache,
+                    &config,
+                    &mut background_state,
+                    &battery_info,
+                    &current_time_str,
+                    &app_state.gcc_adapter_poll_rate,
+                    scale_factor,
+                );
+            }
+            Screen::AndroidControllerSetup => {
+                match android_controller_state.handle_input(&input_state) {
+                    ui::android_controller::AndroidControllerEvent::Move => {
+                        animation_state.trigger_transition(&config.cursor_transition_speed);
+                        sound_effects.play_cursor_move(&config);
+                    }
+                    ui::android_controller::AndroidControllerEvent::Select => {
+                        sound_effects.play_select(&config);
+                    }
+                    ui::android_controller::AndroidControllerEvent::Reject => {
+                        sound_effects.play_reject(&config);
+                    }
+                    ui::android_controller::AndroidControllerEvent::Back => {
+                        current_screen = Screen::Extras;
+                        sound_effects.play_back(&config);
+                    }
+                    ui::android_controller::AndroidControllerEvent::None => {}
+                }
+                ui::android_controller::draw(
+                    &android_controller_state,
                     &animation_state,
                     &logo_cache,
                     &background_cache,

@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""List Android carts/APKs and persist per-game touch or gamepad modes."""
+from __future__ import annotations
+import hashlib, json, os, re, subprocess, sys
+from pathlib import Path
+
+MODE_ROOT = Path("/var/kazeta/state/android-controller-modes")
+INTERNAL_ROOTS = (Path("/var/kazeta/internal-games"), Path("/var/kazeta/storage"))
+MEDIA_ROOTS = (Path("/run/media/gamer"), Path("/run/media"), Path("/media"))
+VALID_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+def parse_kzi(path: Path) -> dict[str, str]:
+    result = {}
+    try:
+        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            if "=" in line:
+                key, value = line.split("=", 1)
+                result.setdefault(key.strip(), value.strip())
+    except OSError:
+        pass
+    return result
+
+def scan_files(root: Path, names: set[str], suffixes: set[str]):
+    if not root.is_dir():
+        return
+    seen = 0
+    for directory, subdirs, files in os.walk(root, followlinks=False):
+        subdirs[:] = [item for item in subdirs if not item.startswith(".")]
+        if len(Path(directory).relative_to(root).parts) > 7:
+            subdirs[:] = []
+        for filename in files:
+            seen += 1
+            if seen > 5000:
+                return
+            path = Path(directory, filename)
+            if filename.lower() in names or path.suffix.lower() in suffixes:
+                yield path
+
+def loose_id(path: Path) -> str:
+    stem = re.sub(r"[^a-z0-9]+", "-", path.stem.lower()).strip("-")[:36] or "game"
+    digest = hashlib.sha256(path.name.lower().encode()).hexdigest()[:10]
+    return f"loose-android-{stem}-{digest}"
+
+def apk_metadata(path: Path) -> tuple[str, str]:
+    try:
+        result = subprocess.run(
+            ["/usr/bin/playfusion-apk-metadata", str(path)],
+            text=True, capture_output=True, timeout=25, check=False,
+        )
+        data = json.loads(result.stdout) if result.returncode == 0 else {}
+        return str(data.get("label") or path.stem), str(data.get("package") or "")
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return path.stem, ""
+
+def saved_mode(game_id: str, default: str) -> str:
+    try:
+        value = (MODE_ROOT / f"{game_id}.mode").read_text().strip().lower()
+        return value if value in {"touch", "gamepad"} else default
+    except OSError:
+        return default
+
+def list_games() -> int:
+    games: dict[str, tuple[str, str, str]] = {}
+    def add_cart(path: Path, source: str) -> None:
+        data = parse_kzi(path)
+        runtime, executable = data.get("Runtime", "").lower(), data.get("Exec", "").lower()
+        if not runtime.startswith("waydroid") and not executable.endswith(".apk"):
+            return
+        game_id = data.get("Id", "")
+        if not VALID_ID.fullmatch(game_id):
+            return
+        default = "touch" if data.get("AndroidInput", "").lower() == "touch" else "gamepad"
+        games.setdefault(game_id, (data.get("Name") or path.parent.name, source, saved_mode(game_id, default)))
+    for root in INTERNAL_ROOTS:
+        for path in scan_files(root, {"cart.kzi"}, set()) or ():
+            add_cart(path, "INTERNAL")
+    for root in MEDIA_ROOTS:
+        for path in scan_files(root, {"cart.kzi"}, {".apk"}) or ():
+            if path.name.lower() == "cart.kzi":
+                add_cart(path, "USB/SD")
+            else:
+                game_id = loose_id(path)
+                if game_id not in games:
+                    label, package = apk_metadata(path)
+                    display = label if not package else f"{label}  [{package}]"
+                    games[game_id] = (display, "USB/SD", saved_mode(game_id, "gamepad"))
+    for game_id, (name, source, mode) in sorted(games.items(), key=lambda item: item[1][0].casefold()):
+        print(f"{game_id}\t{name.replace(chr(9), ' ').replace(chr(10), ' ')}\t{source}\t{mode}")
+    return 0
+
+def set_mode(game_id: str, mode: str) -> int:
+    if not VALID_ID.fullmatch(game_id) or mode not in {"touch", "gamepad"}:
+        print("Invalid Android game ID or controller mode.", file=sys.stderr)
+        return 2
+    MODE_ROOT.mkdir(parents=True, exist_ok=True)
+    temporary = MODE_ROOT / f".{game_id}.mode.{os.getpid()}"
+    temporary.write_text(mode + "\n")
+    os.chmod(temporary, 0o644)
+    os.replace(temporary, MODE_ROOT / f"{game_id}.mode")
+    return 0
+
+def main() -> int:
+    if len(sys.argv) == 2 and sys.argv[1] == "list":
+        return list_games()
+    if len(sys.argv) == 4 and sys.argv[1] == "set":
+        return set_mode(sys.argv[2], sys.argv[3])
+    print("usage: playfusion-android-controller-mode list|set GAME_ID touch|gamepad", file=sys.stderr)
+    return 2
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -3,6 +3,17 @@
 These issues apply to the PlayFusion 1.0.1 public installer unless noted
 otherwise. Confirmed fixes will be recorded in `CHANGELOG.md` when released.
 
+## Experimental Android support
+
+The Waydroid runtime and Android controller tools are experimental and are not
+release-qualified in PlayFusion 1.0.2. No APKs are installed in the factory
+library. Some APKs can return to the PlayFusion menu, lack visible touch input,
+or fail on kernels and graphics drivers that do not satisfy Waydroid's
+requirements.
+
+Status: development is paused. Android support must not be treated as a stable
+feature when qualifying the 1.0.2 installer.
+
 ## MP3 and Digital Jukebox playback
 
 On some hardware, attempting to play an MP3 directly or through the Digital
@@ -12,7 +23,8 @@ immediately after the Xbox controller is detected. This points to the current
 MPV gamepad action mapping, not projectM, the codec, or a damaged audio file.
 Movie playback and game audio are not affected.
 
-Status: confirmed and targeted for PlayFusion 1.0.2.
+Status: fixed in the in-development PlayFusion 1.0.2 source and verified on
+real hardware. The published PlayFusion 1.0.1 image is still affected.
 
 ## Artwork completion on larger removable-media libraries
 

@@ -29,9 +29,9 @@ tar --numeric-owner --acls --xattrs \
 
 sed -i \
     -e 's/^iso_name=.*/iso_name="playfusion"/' \
-    -e 's/^iso_label=.*/iso_label="PLAYFUSION_1_0"/' \
+    -e 's/^iso_label=.*/iso_label="PLAYFUSION_1_0_2"/' \
     -e 's|^iso_publisher=.*|iso_publisher="PlayFusion <https://github.com/kazetaos>"|' \
-    -e 's/^iso_application=.*/iso_application="PlayFusion 1.0 Installer"/' \
+    -e 's/^iso_application=.*/iso_application="PlayFusion 1.0.2 Installer"/' \
     "$PROFILE"
 
 # The large deployment payload is already XZ-compressed.  Zstd keeps the live
@@ -41,12 +41,12 @@ sed -i \
     "s/airootfs_image_tool_options=.*/airootfs_image_tool_options=('-comp' 'zstd' '-Xcompression-level' '3' '-b' '1M')/" \
     "$PROFILE"
 
-sed -i 's/title   Install Kazeta/title   Install PlayFusion 1.0/' \
+sed -i -E 's/title   Install (Kazeta|PlayFusion[^$]*)/title   Install PlayFusion 1.0.2/' \
     "$WORK/installer/efiboot/loader/entries/archiso-x86_64-linux.conf"
 
 sed -i \
     -e 's/^NAME=.*/NAME="PlayFusion Installer"/' \
-    -e 's/^PRETTY_NAME=.*/PRETTY_NAME="PlayFusion 1.0 Installer"/' \
+    -e 's/^PRETTY_NAME=.*/PRETTY_NAME="PlayFusion 1.0.2 Installer"/' \
     "$AIROOT/etc/os-release"
 
 # The installed PlayFusion deployment intentionally uses Kazeta's frozen

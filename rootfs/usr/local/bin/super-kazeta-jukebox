@@ -13,9 +13,11 @@ VISUAL_MODE="${4:---fullscreen}"
 PROJECTM_BIN="/usr/bin/projectM-pulseaudio"
 BEZEL_BIN="/usr/local/bin/playfusion-jukebox-bezel"
 BEZEL_IMAGE="/usr/share/playfusion/playfusion-jukebox-cabinet.png"
-PROJECTM_CONFIG="$HOME/.projectM/config.inp"
+PROJECTM_HOME="${PLAYFUSION_PROJECTM_HOME:-/var/kazeta/state/projectm-home}"
+PROJECTM_CONFIG="$PROJECTM_HOME/.projectM/config.inp"
+PLAYFUSION_CACHE_ROOT="/var/kazeta/state/cache"
 SYSTEM_PRESET_ROOT="/usr/share/projectM/presets"
-FLAT_PRESET_ROOT="$HOME/.local/share/playfusion/projectm-presets"
+FLAT_PRESET_ROOT="$PROJECTM_HOME/.local/share/playfusion/projectm-presets"
 
 case "$PRESET_SECONDS" in
     5|10|15|20|25) ;;
@@ -71,7 +73,8 @@ if [[ "$PLAY_MODE" == "--shuffle" && ${#TRACKS[@]} -gt 1 ]]; then
 fi
 
 prepare_projectm() {
-    mkdir -p "$(dirname "$PROJECTM_CONFIG")" "$FLAT_PRESET_ROOT"
+    mkdir -p "$(dirname "$PROJECTM_CONFIG")" "$FLAT_PRESET_ROOT" \
+        "$PLAYFUSION_CACHE_ROOT"
 
     if [[ ! -s "$PROJECTM_CONFIG" ]]; then
         cp "$PROJECTM_TEMPLATE" "$PROJECTM_CONFIG"
@@ -215,9 +218,12 @@ if [[ -x "$PROJECTM_BIN" ]]; then
     prepare_cabinet_geometry
     prepare_projectm
     if [[ -n "$MONITOR_SOURCE" ]]; then
-        PULSE_SOURCE="$MONITOR_SOURCE" "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
+        HOME="$PROJECTM_HOME" XDG_CACHE_HOME="$PLAYFUSION_CACHE_ROOT" \
+            PULSE_SOURCE="$MONITOR_SOURCE" \
+            "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
     else
-        "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
+        HOME="$PROJECTM_HOME" XDG_CACHE_HOME="$PLAYFUSION_CACHE_ROOT" \
+            "$PROJECTM_BIN" >"$PROJECTM_LOG" 2>&1 &
     fi
     PROJECTM_PID=$!
 

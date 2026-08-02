@@ -1,0 +1,3 @@
+# PlayFusion's fixed Android helpers require Waydroid's root-only shell action.
+# Only the Waydroid shell subcommand is permitted without a password.
+gamer ALL=(root) NOPASSWD: /usr/bin/waydroid shell *

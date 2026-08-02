@@ -4,6 +4,40 @@ This file records user-visible changes in every public PlayFusion release.
 Unresolved problems are tracked separately in
 [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
+## 1.0.2 - 2026-08-02 (testing release)
+
+### Fixed
+
+- Fixed MP3 and Digital Jukebox exit code 4 on read-only public installs.
+- Moved projectM configuration, preset links, and font caches to persistent
+  writable storage under `/var/kazeta/state`.
+- Preserved both fullscreen projectM and cabinet-mode off-screen visualization.
+- Verified MPV playback, projectM rendering, HDMI monitor capture, and cabinet
+  rendering on real hardware.
+- Added the active profile avatar and profile name to the top-right corner of
+  the home screen.
+- Added left/right placement for the active-profile badge and made its border
+  and text follow the selected theme's highlight and font colors.
+- Added the optimized original Xbox theme and the native-rendered Xbox 2.0
+  theme, both with matching system-folder artwork and an optional validated
+  Xbox boot animation.
+- Added safe optional per-theme H.264 boot animations with strict limits and
+  automatic fallback to the built-in splash.
+- Theme boot animations now replace the native cartridge splash; the native
+  splash remains the fallback for the Default theme or an invalid theme video.
+- Theme video playback now uses the same Vega-safe OpenGL/VA-API-copy path as
+  the corrected movie player to prevent flashing and corrupted frames.
+- Added a PlayFusion-only update channel with exact signed `.pfu` assets,
+  cumulative-version support, protected user data, transactional file backups,
+  immediate failure rollback, and a next-boot UI health check.
+- Added offline signed updates from an `updates/` folder on USB or SD.
+- Updated the public installer to ship all 39 runtimes, both approved Xbox
+  themes, a clean 720p Retro Laser Grid factory configuration, and only the
+  two approved factory games.
+- Removed private Waydroid APK test state from the public deployment and added
+  a release gate that rejects `btrfs.compression` attributes incompatible with
+  the installer's nodatacow target.
+
 ## 1.0.1 - 2026-08-01
 
 ### Fixed

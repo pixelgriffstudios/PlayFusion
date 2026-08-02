@@ -90,6 +90,7 @@ pub enum Screen {
     StorageExpansion,
     BiosFiles,
     ControllerSetup,
+    AndroidControllerSetup,
     Profiles,
     Power,
     About,

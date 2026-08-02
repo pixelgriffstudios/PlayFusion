@@ -22,7 +22,10 @@ pub const EXTRAS_MENU_OPTIONS: &[&str] = &[
     "BIOS FILES",
     "GAME MANAGER",
     "CONTROLLER SETUP",
+    "ANDROID CONTROLLER SUPPORT",
     "USER PROFILES",
+    "THEME MANAGEMENT",
+    "CHECK FOR UPDATES",
     "PC CONTROLLER PROFILES",
 ];
 
@@ -66,8 +69,11 @@ pub fn update(
             7 => *current_screen = Screen::BiosFiles,
             8 => *current_screen = Screen::GameManager,
             9 => *current_screen = Screen::ControllerSetup,
-            10 => *current_screen = Screen::Profiles,
-            11 => {
+            10 => *current_screen = Screen::AndroidControllerSetup,
+            11 => *current_screen = Screen::Profiles,
+            12 => *current_screen = Screen::ThemeDownloader,
+            13 => *current_screen = Screen::UpdateChecker,
+            14 => {
                 let _ = Command::new("/usr/bin/playfusion-pc-controller-profiles").status();
             }
             _ => {}

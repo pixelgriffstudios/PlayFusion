@@ -51,6 +51,7 @@ pub const GUI_CUSTOMIZATION_SETTINGS: &[&str] = &[
     "CURSOR STYLE",
     "CURSOR BLINK SPEED",
     "TRANSITION ANIMATION",
+    "PROFILE BADGE POSITION",
     "AUDIO SETTINGS",
     "CUSTOM ASSETS SETTINGS",
 ];
@@ -375,8 +376,9 @@ pub fn get_settings_value(
             4 => config.cursor_style.clone(),                          // CURSOR STYLE
             5 => config.cursor_blink_speed.clone(),                    // CURSOR BLINK SPEED
             6 => config.cursor_transition_speed.clone(),               // CURSOR TRANSITION SPEED
-            7 => "<-".to_string(),
-            8 => "->".to_string(),
+            7 => config.profile_badge_position.clone(),
+            8 => "<-".to_string(),
+            9 => "->".to_string(),
             _ => "".to_string(),
         },
         // CUSTOM ASSETS
@@ -991,6 +993,19 @@ pub fn update(
                 }
             }
             7 => {
+                // ACTIVE PROFILE BADGE POSITION
+                if input_state.left || input_state.right {
+                    config.profile_badge_position =
+                        if config.profile_badge_position.eq_ignore_ascii_case("LEFT") {
+                            "RIGHT".to_string()
+                        } else {
+                            "LEFT".to_string()
+                        };
+                    config.save();
+                    sound_effects.play_cursor_move(config);
+                }
+            }
+            8 => {
                 // GO TO AUDIO SETTINGS
                 if input_state.select {
                     *current_screen = Screen::AudioSettings;
@@ -998,7 +1013,7 @@ pub fn update(
                     sound_effects.play_select(&config);
                 }
             }
-            8 => {
+            9 => {
                 // GO TO CUSTOM ASSETS
                 if input_state.select {
                     *current_screen = Screen::AssetSettings;

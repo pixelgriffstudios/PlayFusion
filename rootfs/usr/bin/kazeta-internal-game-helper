@@ -207,6 +207,7 @@ system_folder_for_kzi() {
         *prosystem*|*atari7800*) printf 'Atari 7800\n' ;;
         *handy*|*lynx*) printf 'Atari Lynx\n' ;;
         *xemu*) printf 'Original Xbox\n' ;;
+        *waydroid*|*.apk*) printf 'Android\n' ;;
         *windows*|*scummvm*) printf 'PC Games\n' ;;
         *) printf 'Other\n' ;;
     esac

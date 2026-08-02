@@ -1,0 +1,1 @@
+gamer ALL=(root) NOPASSWD: /usr/bin/playfusion-waydroid-prepare

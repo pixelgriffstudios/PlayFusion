@@ -12,6 +12,7 @@ use macroquad::prelude::*;
 use std::{collections::HashMap, fs, path::Path};
 
 pub mod about;
+pub mod android_controller;
 pub mod backgrounds;
 pub mod bios_files;
 pub mod bluetooth;
@@ -44,10 +45,8 @@ pub fn load_safe_image_texture(path: &Path) -> Result<Texture2D, String> {
     let decoded = ::image::load_from_memory(&bytes)
         .map_err(|error| format!("Unable to decode {}: {error}", path.display()))?
         .to_rgba8();
-    let width =
-        u16::try_from(decoded.width()).map_err(|_| "image is too wide".to_string())?;
-    let height =
-        u16::try_from(decoded.height()).map_err(|_| "image is too tall".to_string())?;
+    let width = u16::try_from(decoded.width()).map_err(|_| "image is too wide".to_string())?;
+    let height = u16::try_from(decoded.height()).map_err(|_| "image is too tall".to_string())?;
     Ok(Texture2D::from_rgba8(width, height, decoded.as_raw()))
 }
 
@@ -183,11 +182,7 @@ pub fn render_background(
     // 1. Try to draw Video
     if config.background_selection.ends_with(".mp4") {
         if let Some(player) = video_cache.get_mut(&config.background_selection) {
-            let loop_time = get_time() % player.duration_secs;
-            if loop_time < 0.1 {
-                player.reset();
-            }
-            player.update(loop_time);
+            player.update(get_time());
 
             let tint_color = if config.color_shift_speed == "OFF" {
                 WHITE

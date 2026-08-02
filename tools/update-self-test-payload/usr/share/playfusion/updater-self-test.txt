@@ -1,0 +1,1 @@
+PlayFusion signed updater self-test payload.

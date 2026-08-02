@@ -1,6 +1,7 @@
 // Make sure you have the right imports and make your structs public
 use crate::audio::SoundEffects;
-use crate::config::get_user_data_dir;
+use crate::config::{get_user_data_dir, Config};
+use crate::MenuPosition;
 use macroquad::prelude::*; // for load_string
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -10,6 +11,8 @@ use std::fs;
 #[derive(Deserialize, Debug, Clone)]
 pub struct ThemeConfigFile {
     pub menu_position: Option<String>,
+    pub profile_badge_position: Option<String>,
+    pub boot_animation: Option<String>,
     pub font_color: Option<String>,
     pub cursor_color: Option<String>,
     pub cursor_style: Option<String>,
@@ -34,6 +37,84 @@ pub struct Theme {
     pub config: ThemeConfigFile, // Store the parsed config
 }
 
+fn parse_menu_position(value: &str) -> MenuPosition {
+    match value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "topleft" => MenuPosition::TopLeft,
+        "topright" => MenuPosition::TopRight,
+        "bottomleft" => MenuPosition::BottomLeft,
+        "bottomright" => MenuPosition::BottomRight,
+        _ => MenuPosition::Center,
+    }
+}
+
+/// Applies only appearance-related values, preserving system, audio, profile,
+/// network, resolution, and screensaver preferences.
+pub fn apply_to_config(config: &mut Config, selected_theme: &Theme) {
+    let defaults = Config::default();
+    let theme_config = &selected_theme.config;
+
+    config.theme = selected_theme.name.clone();
+    config.menu_position = theme_config
+        .menu_position
+        .as_deref()
+        .map(parse_menu_position)
+        .unwrap_or(defaults.menu_position);
+    config.profile_badge_position = theme_config
+        .profile_badge_position
+        .as_deref()
+        .filter(|position| matches!(position.to_ascii_uppercase().as_str(), "LEFT" | "RIGHT"))
+        .map(|position| position.to_ascii_uppercase())
+        .unwrap_or(defaults.profile_badge_position);
+    config.font_color = theme_config
+        .font_color
+        .clone()
+        .unwrap_or(defaults.font_color);
+    config.cursor_color = theme_config
+        .cursor_color
+        .clone()
+        .unwrap_or(defaults.cursor_color);
+    config.cursor_style = theme_config
+        .cursor_style
+        .clone()
+        .unwrap_or(defaults.cursor_style);
+    config.cursor_blink_speed = theme_config
+        .cursor_blink_speed
+        .clone()
+        .unwrap_or(defaults.cursor_blink_speed);
+    config.cursor_transition_speed = theme_config
+        .cursor_transition_speed
+        .clone()
+        .unwrap_or(defaults.cursor_transition_speed);
+    config.background_scroll_speed = theme_config
+        .background_scroll_speed
+        .clone()
+        .unwrap_or(defaults.background_scroll_speed);
+    config.color_shift_speed = theme_config
+        .color_shift_speed
+        .clone()
+        .unwrap_or(defaults.color_shift_speed);
+    config.bgm_track = theme_config.bgm_track.clone().or(defaults.bgm_track);
+    config.sfx_pack = theme_config.sfx_pack.clone().unwrap_or(defaults.sfx_pack);
+    config.logo_selection = theme_config
+        .logo_selection
+        .clone()
+        .unwrap_or(defaults.logo_selection);
+    config.background_selection = theme_config
+        .background_selection
+        .clone()
+        .unwrap_or(defaults.background_selection);
+    config.font_selection = theme_config
+        .font_selection
+        .clone()
+        .unwrap_or(defaults.font_selection);
+}
+
 // LOAD CUSTOM THEMES
 pub async fn load_all_themes() -> HashMap<String, Theme> {
     let mut themes = HashMap::new();
@@ -47,6 +128,8 @@ pub async fn load_all_themes() -> HashMap<String, Theme> {
         config: ThemeConfigFile {
             // Create an empty config, just like from an empty theme.toml
             menu_position: None,
+            profile_badge_position: None,
+            boot_animation: None,
             font_color: None,
             cursor_color: None,
             cursor_style: None,

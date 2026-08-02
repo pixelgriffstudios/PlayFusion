@@ -26,7 +26,7 @@ cd /
            -o -name 'optical-*' \) -print
     find etc/sudoers.d -maxdepth 1 -type f \
         \( -name '99-kazeta*' -o -name '99-playfusion*' \
-           -o -name '99-super-kazeta*' \) -print
+           -o -name '99-super-kazeta*' -o -name 'playfusion-*' \) -print
     find etc/udev/rules.d -maxdepth 1 -type f \
         \( -name '*kazeta*' -o -name '*playfusion*' -o -name '*optical*' \) -print
     find etc/lightdm/lightdm.conf.d -maxdepth 1 -type f -print

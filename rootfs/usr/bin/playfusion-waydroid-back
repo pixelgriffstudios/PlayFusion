@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Android KEYCODE_BACK. This navigates inside the app without terminating the
+# surrounding PlayFusion cartridge session.
+timeout 3 sudo -n waydroid shell input keyevent 4 >/dev/null 2>&1 || true

@@ -36,6 +36,8 @@ pub struct Config {
     pub audio_output: String,
     pub theme: String,
     pub menu_position: MenuPosition,
+    #[serde(default = "default_profile_badge_position")]
+    pub profile_badge_position: String,
     pub font_color: String,
     pub cursor_color: String,
     pub cursor_style: String,
@@ -68,6 +70,7 @@ impl Default for Config {
             audio_output: "Auto".to_string(),
             theme: "Default".to_string(),
             menu_position: MenuPosition::Center,
+            profile_badge_position: default_profile_badge_position(),
             font_color: "PLAYFUSION".to_string(),
             cursor_color: "PLAYFUSION".to_string(),
             cursor_style: "BOX".to_string(),
@@ -94,6 +97,10 @@ fn default_screensaver_idle_seconds() -> u64 {
 
 fn default_jukebox_visual_seconds() -> u64 {
     25
+}
+
+fn default_profile_badge_position() -> String {
+    "RIGHT".to_string()
 }
 
 impl Config {

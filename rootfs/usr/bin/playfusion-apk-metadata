@@ -1,0 +1,127 @@
+#!/var/kazeta/state/apk-metadata-venv/bin/python
+"""Read stable PlayFusion metadata and the launcher icon from an APK."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import zipfile
+from pathlib import Path
+
+from apkutils import APK
+
+
+def icon_candidates(apk: APK, archive: zipfile.ZipFile) -> list[str]:
+    try:
+        resource_id = int(apk._application_icon_addr, 16)
+        entries = apk.arsc.resource_values.get(resource_id, {})
+    except (AttributeError, TypeError, ValueError):
+        entries = {}
+
+    candidates: list[str] = []
+    names = set(archive.namelist())
+    for entry in entries.values():
+        try:
+            name = entry.get_key_data()
+        except Exception:
+            continue
+        if isinstance(name, str) and name in names and name not in candidates:
+            candidates.append(name)
+
+    # Prefer the largest raster density. Adaptive XML icons are retained as
+    # metadata but require composition, so a raster candidate wins when one is
+    # available.
+    candidates.sort(
+        key=lambda name: (
+            Path(name).suffix.lower() in {".png", ".webp"},
+            archive.getinfo(name).file_size,
+        ),
+        reverse=True,
+    )
+    return candidates
+
+
+def extract_icon(archive: zipfile.ZipFile, candidates: list[str], output: Path) -> bool:
+    raster = next(
+        (name for name in candidates if Path(name).suffix.lower() in {".png", ".webp"}),
+        None,
+    )
+    if not raster:
+        return False
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    suffix = Path(raster).suffix.lower()
+    with archive.open(raster) as source:
+        if suffix == ".png":
+            temporary = output.with_name(f".{output.name}.{os.getpid()}")
+            with temporary.open("wb") as destination:
+                shutil.copyfileobj(source, destination)
+            os.replace(temporary, output)
+            return True
+
+        with tempfile.TemporaryDirectory(prefix="playfusion-apk-icon-") as work:
+            webp = Path(work) / "icon.webp"
+            webp.write_bytes(source.read())
+            result = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-v",
+                    "error",
+                    "-y",
+                    "-i",
+                    str(webp),
+                    str(output),
+                ],
+                check=False,
+            )
+            return result.returncode == 0 and output.is_file() and output.stat().st_size > 0
+
+
+def inspect(apk_path: Path, icon_output: Path | None) -> dict[str, object]:
+    if not apk_path.is_file() or not zipfile.is_zipfile(apk_path):
+        raise ValueError("not a valid APK/ZIP file")
+
+    apk = APK.from_file(str(apk_path)).parse_resource()
+    try:
+        with zipfile.ZipFile(apk_path) as archive:
+            candidates = icon_candidates(apk, archive)
+            icon_written = bool(icon_output and extract_icon(archive, candidates, icon_output))
+        activities = apk.get_manifest_main_activities() or []
+        return {
+            "package": apk.package_name or "",
+            "label": apk.app_name or apk_path.stem,
+            "version": apk.version_name or "",
+            "activity": activities[0] if activities else "",
+            "icon_candidates": candidates,
+            "icon_written": icon_written,
+        }
+    finally:
+        apk.close()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("apk", type=Path)
+    parser.add_argument("--icon", type=Path)
+    parser.add_argument("--field", choices=("package", "label", "version", "activity"))
+    args = parser.parse_args()
+
+    try:
+        metadata = inspect(args.apk, args.icon)
+    except Exception as error:
+        print(json.dumps({"error": str(error)}, ensure_ascii=False))
+        return 2
+
+    if args.field:
+        print(metadata[args.field])
+    else:
+        print(json.dumps(metadata, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

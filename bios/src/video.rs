@@ -21,6 +21,8 @@ pub struct VideoPlayer {
     // [!] NEW FIELDS FOR SYNC
     time_base: f64,    // To convert timestamps to seconds
     frame_ready: bool, // Do we have a decoded frame waiting?
+    playback_time: f64,
+    last_clock_time: Option<f64>,
 }
 
 impl VideoPlayer {
@@ -79,12 +81,30 @@ impl VideoPlayer {
             duration_secs,
             time_base,
             frame_ready: false, // Start empty
+            playback_time: 0.0,
+            last_clock_time: None,
         })
     }
 
     /// Updates the texture to match the elapsed time.
     /// Returns None if the video has finished.
-    pub fn update(&mut self, elapsed_time: f64) -> Option<()> {
+    pub fn update(&mut self, clock_time: f64) -> Option<()> {
+        // Advance only by time spent actively rendering this video. This keeps
+        // a newly selected theme from decoding thousands of frames to catch up
+        // with the application's global uptime.
+        if let Some(previous_clock) = self.last_clock_time.replace(clock_time) {
+            let delta = clock_time - previous_clock;
+            if delta.is_finite() && (0.0..=0.25).contains(&delta) {
+                self.playback_time += delta;
+            }
+        }
+
+        if self.duration_secs > 0.0 && self.playback_time >= self.duration_secs {
+            self.reset();
+            self.last_clock_time = Some(clock_time);
+        }
+
+        let elapsed_time = self.playback_time;
         loop {
             // 1. Decode a frame if we don't have one ready
             if !self.frame_ready {
@@ -102,7 +122,9 @@ impl VideoPlayer {
                 }
                 // If we finished the packet loop without a frame, we are likely at EOF
                 if !decoded {
-                    return None;
+                    self.reset();
+                    self.last_clock_time = Some(clock_time);
+                    return Some(());
                 }
             }
 
@@ -151,7 +173,10 @@ impl VideoPlayer {
         // allow video to loop (for themes that use a video background)
         // Seek to the beginning of the file
         let _ = self.input_context.seek(0, ..);
+        self.decoder.flush();
         // Clear the frame ready flag so we decode immediately
         self.frame_ready = false;
+        self.playback_time = 0.0;
+        self.last_clock_time = None;
     }
 }

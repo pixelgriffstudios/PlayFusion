@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -u
+
+PENDING=/var/lib/playfusion-updater/pending-health
+HEALTHY=/run/playfusion-ui-healthy
+
+test -r "$PENDING" || exit 0
+for _attempt in $(seq 1 90); do
+    if test -e "$HEALTHY"; then
+        exec /usr/bin/playfusion-update-helper confirm-health
+    fi
+    sleep 1
+done
+
+logger -t playfusion-update "Updated UI did not become healthy; rolling back."
+/usr/bin/playfusion-update-helper rollback-pending || exit 1
+systemctl reboot

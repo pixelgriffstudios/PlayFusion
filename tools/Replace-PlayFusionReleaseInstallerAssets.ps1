@@ -48,7 +48,10 @@ $release = Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/r
 $uploadBase = $release.upload_url -replace '\{.*$', ''
 
 function Get-ReleaseAssets {
-    @(Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/$Repository/releases/$($release.id)/assets?per_page=100")
+    $response = Invoke-RestMethod -Headers $apiHeaders -Uri "https://api.github.com/repos/$Repository/releases/$($release.id)/assets?per_page=100"
+    foreach ($asset in $response) {
+        Write-Output $asset
+    }
 }
 
 function Remove-ReleaseAsset([object]$Asset) {
@@ -88,6 +91,13 @@ $temporarySuffix = '.uploading-v102-fixed'
 $assets = Get-ReleaseAssets
 foreach ($file in $files) {
     $temporaryName = $file.Name + $temporarySuffix
+    $existing = $assets | Where-Object name -eq $temporaryName | Select-Object -First 1
+    $localDigest = 'sha256:' + (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($existing -and $existing.size -eq $file.Length -and
+        (-not $existing.digest -or $existing.digest -eq $localDigest)) {
+        Write-Host "Reusing verified staged asset $($file.Name)"
+        continue
+    }
     foreach ($stale in @($assets | Where-Object name -eq $temporaryName)) {
         Remove-ReleaseAsset $stale
     }

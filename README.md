@@ -31,6 +31,7 @@ Before installing, review the [changelog](CHANGELOG.md) and
   PlayFusion, Kazeta+, and compatible Kazeta installations.
 - **[Runtime catalog and BIOS guide](https://github.com/pixelgriffstudios/PlayFusion-Runtimes)** — system support, installation paths, required firmware, and checksums.
 
+- **[PlayFusion theme downloads](https://github.com/pixelgriffstudios/PlayFusion-Themes/releases/latest)** — PlayFusion-native themes, matching system-folder artwork, and backward-compatible Kazeta+ packages.
 - **[Theme and USB theme guide](docs/themes.md)** — create, package, import,
   apply, and reset PlayFusion or backward-compatible Kazeta+ themes.
 - **[Signed update guide](docs/updates.md)** — cumulative internet/offline

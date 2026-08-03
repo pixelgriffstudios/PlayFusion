@@ -8,6 +8,14 @@ Unresolved problems are tracked separately in
 
 ### Fixed
 
+- Fixed legacy 1.0 update installation when sudo executes the bridge through
+  `/dev/fd`, and replaced the running BIOS atomically to avoid `ETXTBSY`.
+- Fixed false automatic rollback by moving the UI health marker from
+  root-owned `/run` to the gamer-owned XDG runtime directory.
+- Restored the hardware-tested PS1 optical helper, title database, udev rules,
+  and PlayStation 1.01 runtime in clean installer deployments.
+- Bundled the complete optimized Xbox and Xbox 2.0 theme archives instead of
+  shipping only an Xbox 2.0 background.
 - Fixed MP3 and Digital Jukebox exit code 4 on read-only public installs.
 - Moved projectM configuration, preset links, and font caches to persistent
   writable storage under `/var/kazeta/state`.

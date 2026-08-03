@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS_NAME="PlayFusion 1.0"
+OS_NAME="PlayFusion 1.0.2"
 MIN_DISK_SIZE=28
 MOUNT_PATH=/tmp/frzr_root
 SEED_ARCHIVE=/root/playfusion-seed.tar
@@ -272,7 +272,7 @@ test "$(stat -c '%u:%g' "${MOUNT_PATH}/var/kazeta/user-data/kazeta-plus")" = 100
 printf '%s\n' 'playfusion/local' > "${MOUNT_PATH}/source"
 sync
 
-MESSAGE="PlayFusion 1.0 installed successfully.
+MESSAGE="PlayFusion 1.0.2 installed successfully.
 
 Included:
   - All 38 system runtimes

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reuse the real-hardware-tested 1.0.1 hybrid ISO/IMG boot shell and replace
-# only its versioned PlayFusion deployment, factory seed, and installer UI.
-BASE=/var/tmp/PlayFusion-1.0.1-base.img
-OUTPUT=/var/tmp/PlayFusion-1.0.2-Public-Installer.img
+# Reuse the real-hardware-tested 1.0.2 hybrid ISO/IMG boot shell and replace
+# only its corrected deployment, factory seed, and installer UI.
+BASE=/var/tmp/PlayFusion-1.0.2-base.img
+OUTPUT=/var/tmp/PlayFusion-1.0.2-Public-Installer-Fixed.img
 RELEASE=/var/tmp/playfusion-release-output
-DEPLOYMENT="$RELEASE/kazeta-2025-0_545b900.img.tar.xz"
+DEPLOYMENT=/var/tmp/playfusion-102-deployment-fixed/kazeta-2025-0_545b900.img.tar.xz
 SEED="$RELEASE/playfusion-seed"
 INSTALLER=/home/gamer/playfusion-public-installer-1.0.2.sh
 WORK=/var/tmp/playfusion-102-repack
@@ -25,7 +25,7 @@ trap cleanup EXIT
 
 test "$(id -u)" -eq 0
 test "$(realpath -m "$WORK")" = /var/tmp/playfusion-102-repack
-test "$(realpath -m "$OUTPUT")" = /var/tmp/PlayFusion-1.0.2-Public-Installer.img
+test "$(realpath -m "$OUTPUT")" = /var/tmp/PlayFusion-1.0.2-Public-Installer-Fixed.img
 test -s "$BASE"
 test -s "$DEPLOYMENT"
 test -d "$SEED"

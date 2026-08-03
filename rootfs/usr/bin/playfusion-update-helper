@@ -83,7 +83,7 @@ rollback_directory() {
     fi
 
     if test -d "$backup/root"; then
-        cp -a -- "$backup/root/." /
+        overlay_root "$backup/root"
     fi
     if test -r "$backup/previous-release"; then
         install -m 0644 "$backup/previous-release" "$CURRENT_RELEASE"
@@ -93,6 +93,26 @@ rollback_directory() {
     systemctl daemon-reload || true
     rm -f -- "$PENDING_FILE"
     printf 'Rollback restored %s\n' "$backup"
+}
+
+# Linux does not permit overwriting the inode of a currently running
+# executable (ETXTBSY).  Replace kazeta-bios through a new inode first, then
+# copy the rest of the tree normally.  This also makes rollback safe while the
+# UI is still running.
+overlay_root() {
+    local source_root=$1
+    local bios_source="$source_root/usr/bin/kazeta-bios"
+    local bios_temp=''
+
+    if test -f "$bios_source"; then
+        bios_temp=$(mktemp /usr/bin/.kazeta-bios.playfusion-update.XXXXXX) || return 1
+        cp -a -- "$bios_source" "$bios_temp" || return 1
+        chown --reference="$bios_source" "$bios_temp" || return 1
+        chmod --reference="$bios_source" "$bios_temp" || return 1
+        mv -Tf -- "$bios_temp" /usr/bin/kazeta-bios || return 1
+    fi
+
+    cp -a -- "$source_root/." / || return 1
 }
 
 install_update() {
@@ -222,7 +242,7 @@ PY
 
     # From this point on, any failure restores the exact pre-update files.
     set +e
-    cp -a -- "$stage/root/." /
+    overlay_root "$stage/root"
     apply_status=$?
     if test "$apply_status" -eq 0 && test -f "$stage/delete.list"; then
         while IFS= read -r relative; do

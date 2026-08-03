@@ -2,11 +2,12 @@
 set -u
 
 PENDING=/var/lib/playfusion-updater/pending-health
-HEALTHY=/run/playfusion-ui-healthy
+HEALTHY=/run/user/1000/playfusion-ui-healthy
+LEGACY_HEALTHY=/run/playfusion-ui-healthy
 
 test -r "$PENDING" || exit 0
 for _attempt in $(seq 1 90); do
-    if test -e "$HEALTHY"; then
+    if test -e "$HEALTHY" || test -e "$LEGACY_HEALTHY"; then
         exec /usr/bin/playfusion-update-helper confirm-health
     fi
     sleep 1

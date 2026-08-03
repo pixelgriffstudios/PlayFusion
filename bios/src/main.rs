@@ -1413,7 +1413,15 @@ async fn main() {
     // The update health service only accepts a release after the UI has
     // loaded its configuration, media state and assets and is ready to draw.
     // /run is recreated every boot, so stale markers cannot mask a bad boot.
-    let _ = fs::write("/run/playfusion-ui-healthy", b"ready\n");
+    // The UI runs as gamer and cannot create files directly under root-owned
+    // /run.  XDG_RUNTIME_DIR is a per-boot, user-writable location, so the
+    // marker cannot be stale and does not require elevated privileges.
+    let health_runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .unwrap_or_else(|_| "/run/user/1000".to_string());
+    let _ = fs::write(
+        format!("{health_runtime_dir}/playfusion-ui-healthy"),
+        b"ready\n",
+    );
 
     // BEGINNING OF MAIN LOOP
     loop {

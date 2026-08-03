@@ -7,6 +7,7 @@ BASE=/var/tmp/PlayFusion-1.0.2-base.img
 OUTPUT=/var/tmp/PlayFusion-1.0.2-Public-Installer-Fixed.img
 RELEASE=/var/tmp/playfusion-release-output
 DEPLOYMENT=/var/tmp/playfusion-102-deployment-fixed/kazeta-2025-0_545b900.img.tar.xz
+DEPLOYMENT_NAME=playfusion-1.0-public
 SEED="$RELEASE/playfusion-seed"
 INSTALLER=/home/gamer/playfusion-public-installer-1.0.2.sh
 WORK=/var/tmp/playfusion-102-repack
@@ -48,7 +49,11 @@ unsquashfs -no-progress -d "$AIROOT" "$ISO_MOUNT/arch/x86_64/airootfs.sfs"
 
 echo '[3/7] Installing the clean 1.0.2 payload and factory seed...'
 rm -f -- "$AIROOT/root"/*.img.tar.xz "$AIROOT/root/playfusion-seed.tar"
-install -m 0444 "$DEPLOYMENT" "$AIROOT/root/kazeta-2025-0_545b900.img.tar.xz"
+# frzr-deploy derives the destination subvolume name from the archive filename.
+# The Btrfs send stream in this release contains playfusion-1.0-public, so the
+# archive must use the same basename or deployment finishes receiving and then
+# fails while copying boot files from a non-existent subvolume.
+install -m 0444 "$DEPLOYMENT" "$AIROOT/root/${DEPLOYMENT_NAME}.img.tar.xz"
 tar --numeric-owner --acls --xattrs -C "$SEED" -cpf "$AIROOT/root/playfusion-seed.tar" .
 chmod 0444 "$AIROOT/root/playfusion-seed.tar"
 install -m 0755 "$INSTALLER" "$AIROOT/root/install.sh"

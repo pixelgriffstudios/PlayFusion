@@ -4,13 +4,16 @@ set -euo pipefail
 IMG=/var/tmp/PlayFusion-1.0.2-Public-Installer-Fixed.img
 WORK=/var/tmp/playfusion-102-repack
 SOURCE_DEPLOYMENT=/var/tmp/playfusion-102-deployment-fixed/kazeta-2025-0_545b900.img.tar.xz
-EMBEDDED_DEPLOYMENT="$WORK/airootfs/root/kazeta-2025-0_545b900.img.tar.xz"
+DEPLOYMENT_NAME=playfusion-1.0-public
+EMBEDDED_DEPLOYMENT="$WORK/airootfs/root/${DEPLOYMENT_NAME}.img.tar.xz"
 SEED_VERIFY=/var/tmp/playfusion-102-seed-verify
 
 test "$(id -u)" -eq 0
 test -s "$IMG"
 test -s "$SOURCE_DEPLOYMENT"
 test -s "$EMBEDDED_DEPLOYMENT"
+test "$(find "$WORK/airootfs/root" -maxdepth 1 -type f -name '*.img.tar.xz' -printf '%f\n')" = \
+    "${DEPLOYMENT_NAME}.img.tar.xz"
 
 toc=$(xorriso -indev "$IMG" -toc 2>&1)
 grep -q 'Boot record  : El Torito , MBR protective-msdos-label.*GPT' <<<"$toc"

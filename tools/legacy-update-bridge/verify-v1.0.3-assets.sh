@@ -52,11 +52,48 @@ import sys, tomllib
 with open(sys.argv[1], "rb") as handle: print(tomllib.load(handle)["payload_sha256"])
 PY
 )"
+
+# Keep this path policy synchronized with playfusion-update-helper so a release
+# cannot pass packaging checks and then be rejected by an installed console.
+safe_payload_path() {
+    local path=${1#./}
+    path=${path%/}
+    case "$path" in
+        ''|/*|.|..|var/kazeta/*|home/*|root/*|boot/*|dev/*|proc/*|sys/*|run/*)
+            return 1 ;;
+        usr|etc|opt|usr/*|etc/*|opt/*) ;;
+        *) return 1 ;;
+    esac
+    case "/$path/" in *'/../'*|*'//'*) return 1 ;; esac
+    case "$path" in
+        usr/bin/playfusion-update-helper|usr/bin/playfusion-update-health|etc/playfusion-update-public.pem|etc/systemd/system/playfusion-update-health.service)
+            return 1 ;;
+    esac
+}
+while IFS= read -r entry; do
+    relative=${entry#./}
+    test -z "$relative" && continue
+    safe_payload_path "$relative" || {
+        printf 'Unsafe updater payload path: %s\n' "$relative" >&2
+        exit 1
+    }
+done < <(bsdtar -tf "$work/payload.tar.zst")
+
 mkdir "$work/root"
 bsdtar -xf "$work/payload.tar.zst" -C "$work/root"
 "$SOURCE/tools/verify-public-rootfs.sh" "$work/root"
 test "$(find "$work/root" -type f -name '*.kzr' -print -quit)" = ''
 test ! -e "$work/root/var/kazeta"
+for protected in \
+    usr/bin/playfusion-update-helper \
+    usr/bin/playfusion-update-health \
+    etc/playfusion-update-public.pem \
+    etc/systemd/system/playfusion-update-health.service; do
+    test ! -e "$work/root/$protected" || {
+        printf 'Protected updater path leaked into payload: %s\n' "$protected" >&2
+        exit 1
+    }
+done
 test -f "$work/post-install"
 bash -n "$work/post-install"
 

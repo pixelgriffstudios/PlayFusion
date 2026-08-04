@@ -26,6 +26,14 @@ cp -a -- "$LIVE_ROOT/opt/playfusion/projectm-4.1.6" "$PAYLOAD/opt/playfusion/"
 # Runtimes, user data, firmware and keys are never part of an incremental OS
 # update. Existing user settings live under /var/kazeta and are untouched.
 find "$PAYLOAD" -type f -name '*.kzr' -delete
+# The native updater deliberately refuses to replace its own trust and health
+# components while it is running. Older releases receive these four files from
+# the verified legacy bridge before the signed payload is applied.
+rm -f -- \
+    "$PAYLOAD/usr/bin/playfusion-update-helper" \
+    "$PAYLOAD/usr/bin/playfusion-update-health" \
+    "$PAYLOAD/etc/playfusion-update-public.pem" \
+    "$PAYLOAD/etc/systemd/system/playfusion-update-health.service"
 printf 'PRODUCT=PlayFusion\nVERSION=1.0.3\n' > "$PAYLOAD/etc/playfusion-release"
 
 while IFS= read -r -d '' file; do

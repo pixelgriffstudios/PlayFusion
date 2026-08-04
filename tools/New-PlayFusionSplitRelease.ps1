@@ -8,6 +8,9 @@ param(
 
     [string]$Version = '1.0.2',
 
+    [ValidateSet('Public', 'Full', 'Lite')]
+    [string]$Edition = 'Public',
+
     # GitHub release assets are limited to 2 GiB. Two billion bytes is a
     # conservative "2 GB" part that remains safely below that hard ceiling.
     [long]$PartSizeBytes = 2000000000
@@ -22,7 +25,11 @@ if ($PartSizeBytes -le 0 -or $PartSizeBytes -ge 2147483648) {
 
 $output = [System.IO.Path]::GetFullPath($OutputDirectory)
 [System.IO.Directory]::CreateDirectory($output) | Out-Null
-$baseName = "PlayFusion-$Version-Public-Installer.img"
+$baseName = if ($Edition -eq 'Public') {
+    "PlayFusion-$Version-Public-Installer.img"
+} else {
+    "PlayFusion-$Version-$Edition-Installer.img"
+}
 
 # Clean only this version's generated artifacts inside the explicitly named
 # release directory. Other releases and arbitrary user files are untouched.
@@ -83,7 +90,7 @@ $checksumLines += "$imageHash  $baseName"
 $rebuildPs1 = @'
 $ErrorActionPreference = 'Stop'
 $folder = Split-Path -Parent $MyInvocation.MyCommand.Path
-$parts = Get-ChildItem -LiteralPath $folder -Filter 'PlayFusion-*-Public-Installer.img.part*' |
+$parts = Get-ChildItem -LiteralPath $folder -Filter 'PlayFusion-*-Installer.img.part*' |
     Sort-Object Name
 if (-not $parts) { throw 'No numbered installer parts were found.' }
 $outputName = $parts[0].Name -replace '\.part\d+$', ''
@@ -126,7 +133,7 @@ $rebuildLinux = @'
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
-base=$(find . -maxdepth 1 -type f -name 'PlayFusion-*-Public-Installer.img.part001' -printf '%f\n' | head -n1)
+base=$(find . -maxdepth 1 -type f -name 'PlayFusion-*-Installer.img.part001' -printf '%f\n' | head -n1)
 test -n "$base"
 output=${base%.part001}
 grep '\.part[0-9][0-9][0-9]$' SHA256SUMS.txt | sha256sum -c -
@@ -143,8 +150,8 @@ printf 'Rebuilt and verified: %s\n' "$output"
 )
 
 $readme = @"
-PlayFusion $Version testing installer
-=====================================
+PlayFusion $Version $Edition installer
+======================================
 
 1. Download every numbered .part file plus SHA256SUMS.txt and the rebuild
    script for your operating system.
@@ -155,7 +162,7 @@ PlayFusion $Version testing installer
 4. Flash the verified IMG with BalenaEtcher or another raw-image writer.
 
 WARNING: Installing PlayFusion erases the selected destination disk.
-PlayFusion 1.0.1 remains available as a rollback while 1.0.2 is qualified on
+PlayFusion 1.0.2 remains available as a rollback until 1.0.3 is qualified on
 real hardware. Use only games, firmware, keys, and media you are authorized to
 use.
 

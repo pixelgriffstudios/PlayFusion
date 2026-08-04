@@ -4,6 +4,43 @@ This file records user-visible changes in every public PlayFusion release.
 Unresolved problems are tracked separately in
 [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
+## 1.0.3 - 2026-08-03
+
+### Added
+
+- Added cumulative, signed internet and offline updates for PlayFusion
+  1.0.0, 1.0.1, and 1.0.2, with transactional backups, automatic rollback,
+  and a next-boot health check.
+- Added the Runtime Manager backed by the PlayFusion-Runtimes release channel,
+  allowing the Lite installer to download runtimes after installation.
+- Rebuilt Theme Management as a controller-friendly gallery with downloaded
+  image or video-frame previews, PlayFusion and Kazeta+ theme compatibility,
+  apply/reset actions, and support for theme-specific profile-badge placement.
+- Added a theme-driven projectM home background, optional MP3 background
+  player, LB/RB track switching, and a temporary now-playing notification.
+- Added OS-only soft reboot and global game-exit/controller hotkeys, including
+  RetroArch menu access.
+- Added separate Full and Lite public installers. The Full image contains all
+  39 release runtimes; the Lite image retains Runtime Manager and downloads
+  only the runtimes selected by the user.
+
+### Fixed
+
+- Restored the lightweight native Digital Jukebox cabinet visualizer while
+  keeping projectM for fullscreen visualization.
+- Made the Data screen and active-profile badge follow the selected theme.
+- Preserved profiles, saves, controller layouts, themes, audio selection,
+  background selection, games, firmware imports, and media across updates.
+- Hardened the public installer so its own USB device can never be offered as
+  an installation target and disks smaller than 32 GB are excluded.
+- Fixed the 1.0 legacy ZIP bridge to resolve the correct versioned update
+  folder and package name.
+- Added release gates that reject BIOS files, encryption keys, private signing
+  keys, personal profiles, saves, and firmware from public images and updates.
+
+See [`docs/RELEASE-1.0.3.md`](docs/RELEASE-1.0.3.md) for installation and
+update-test notes.
+
 ## 1.0.2 - 2026-08-02 (testing release)
 
 ### Fixed

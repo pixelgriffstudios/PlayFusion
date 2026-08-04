@@ -11,7 +11,18 @@ use crate::{
 };
 use std::collections::HashMap;
 
-pub const POWER_MENU_OPTIONS: &[&str] = &["SHUT DOWN", "REBOOT", "CANCEL"];
+pub const POWER_MENU_OPTIONS: &[&str] = &[
+    "SHUT DOWN",
+    "RESTART PLAYFUSION",
+    "REBOOT PC",
+    "CANCEL",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerEvent {
+    None,
+    RestartPlayFusion,
+}
 
 fn run_power_command(action: &str, arguments: &[&str]) {
     if let Err(error) = Command::new("sudo")
@@ -31,7 +42,7 @@ pub fn update(
     animation_state: &mut AnimationState,
     sound_effects: &SoundEffects,
     config: &Config,
-) {
+) -> PowerEvent {
     if input_state.up {
         *selection = if *selection == 0 {
             POWER_MENU_OPTIONS.len() - 1
@@ -49,7 +60,7 @@ pub fn update(
     if input_state.back {
         *current_screen = Screen::MainMenu;
         sound_effects.play_back(config);
-        return;
+        return PowerEvent::None;
     }
     if input_state.select {
         match *selection {
@@ -59,6 +70,10 @@ pub fn update(
             }
             1 => {
                 sound_effects.play_select(config);
+                return PowerEvent::RestartPlayFusion;
+            }
+            2 => {
+                sound_effects.play_select(config);
                 run_power_command("reboot", &[]);
             }
             _ => {
@@ -67,6 +82,7 @@ pub fn update(
             }
         }
     }
+    PowerEvent::None
 }
 
 pub fn draw(

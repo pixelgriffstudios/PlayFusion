@@ -4,6 +4,7 @@ use std::{fs, path::PathBuf};
 
 pub const PROCEDURAL_BACKGROUNDS: &[&str] = &[
     "Retro Laser Grid",
+    "ProjectM Fusion",
     "Xbox 2.0",
     "Cartridge Energy Core",
     "Neon Console Interior",

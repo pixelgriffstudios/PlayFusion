@@ -10,8 +10,11 @@ use rodio::Sink;
 use std::{
     collections::HashMap,
     ffi::{c_void, CString},
+    fs,
     path::PathBuf,
     process::{Child, Command},
+    thread,
+    time::Duration,
 };
 
 extern "C" {
@@ -44,6 +47,7 @@ pub struct MediaPlayerState {
     jukebox_cabinet: Texture2D,
     projectm_texture: Option<Texture2D>,
     projectm_native: *mut c_void,
+    projectm_warmup_started: f64,
     return_screen: Screen,
 }
 
@@ -59,6 +63,7 @@ impl MediaPlayerState {
             jukebox_cabinet: Texture2D::from_file_with_format(JUKEBOX_CABINET_BYTES, None),
             projectm_texture: None,
             projectm_native: std::ptr::null_mut(),
+            projectm_warmup_started: -10.0,
             return_screen: Screen::Extras,
         }
     }
@@ -153,6 +158,30 @@ impl MediaPlayerState {
     fn start_native_projectm(&mut self) {
         self.stop_native_projectm();
 
+        // The launcher creates the user-writable projectM configuration on
+        // first use.  A clean install used to race that setup and ask the
+        // native renderer to open a file that did not exist yet, leaving the
+        // cabinet black until a later launch. Wait for a complete config so
+        // first launch behaves exactly like every subsequent launch.
+        let config_file = PathBuf::from("/var/kazeta/state/projectm-home/.projectM/config.inp");
+        let mut config_ready = false;
+        for _ in 0..200 {
+            config_ready = fs::metadata(&config_file)
+                .map(|metadata| metadata.len() > 0)
+                .unwrap_or(false);
+            if config_ready {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if !config_ready {
+            eprintln!(
+                "[Jukebox] projectM configuration was not prepared: {}",
+                config_file.display()
+            );
+            return;
+        }
+
         let sink = Command::new("/usr/bin/pactl")
             .args(["get-default-sink"])
             .output()
@@ -165,20 +194,26 @@ impl MediaPlayerState {
         } else {
             format!("{sink}.monitor")
         };
-        let Ok(config_path) = CString::new("/var/kazeta/state/projectm-home/.projectM/config.inp")
-        else {
+        let Ok(config_path) = CString::new(config_file.to_string_lossy().as_bytes()) else {
             return;
         };
         let Ok(monitor) = CString::new(monitor) else {
             return;
         };
-        let width = (screen_width() * (341.0 / 640.0)).round().max(320.0) as i32;
-        let height = (screen_height() * (191.0 / 360.0)).round().max(180.0) as i32;
+        // Match the cabinet's physical on-screen size, capped at 1080p. This
+        // is sharp on a 4K TV without doing a wasteful full-screen 4K render
+        // for the much smaller cabinet opening.
+        let requested_width = screen_width() * (341.0 / 640.0);
+        let width = requested_width.round().clamp(640.0, 1920.0) as i32;
+        let height = (width * 9 / 16).max(270);
 
         unsafe {
-            macroquad::window::get_internal_gl().flush();
+            let mut gl = macroquad::window::get_internal_gl();
+            gl.flush();
+            gl.quad_gl.reset();
             self.projectm_native =
                 playfusion_projectm_create(config_path.as_ptr(), monitor.as_ptr(), width, height);
+            gl.quad_gl.reset();
             if !self.projectm_native.is_null() {
                 let raw_texture = playfusion_projectm_texture(self.projectm_native);
                 if raw_texture != 0 {
@@ -186,9 +221,9 @@ impl MediaPlayerState {
                         macroquad::miniquad::RawId::OpenGl(raw_texture),
                     );
                     self.projectm_texture = Some(Texture2D::from_miniquad_texture(texture_id));
+                    self.projectm_warmup_started = get_time();
                 }
             }
-            macroquad::window::get_internal_gl().flush();
         }
     }
 
@@ -197,9 +232,11 @@ impl MediaPlayerState {
             return;
         }
         unsafe {
-            macroquad::window::get_internal_gl().flush();
+            let mut gl = macroquad::window::get_internal_gl();
+            gl.flush();
+            gl.quad_gl.reset();
             playfusion_projectm_render(self.projectm_native);
-            macroquad::window::get_internal_gl().flush();
+            gl.quad_gl.reset();
         }
     }
 
@@ -207,12 +244,15 @@ impl MediaPlayerState {
         self.projectm_texture = None;
         if !self.projectm_native.is_null() {
             unsafe {
-                macroquad::window::get_internal_gl().flush();
+                let mut gl = macroquad::window::get_internal_gl();
+                gl.flush();
+                gl.quad_gl.reset();
                 playfusion_projectm_destroy(self.projectm_native);
-                macroquad::window::get_internal_gl().flush();
+                gl.quad_gl.reset();
             }
             self.projectm_native = std::ptr::null_mut();
         }
+        self.projectm_warmup_started = -10.0;
     }
 
     pub fn update(
@@ -274,7 +314,10 @@ impl MediaPlayerState {
             }
         }
 
-        if requested_mode == MediaMode::Jukebox && !self.jukebox_fullscreen {
+        if requested_mode == MediaMode::Jukebox
+            && !self.jukebox_fullscreen
+            && self.process.is_some()
+        {
             self.render_native_projectm();
         }
     }
@@ -335,7 +378,8 @@ impl MediaPlayerState {
             let view_y = 73.0 * cabinet_scale_y;
             let view_w = 341.0 * cabinet_scale_x;
             let view_h = 191.0 * cabinet_scale_y;
-            if let Some(projectm) = self.projectm_texture.as_ref() {
+            let projectm_ready = get_time() - self.projectm_warmup_started >= 5.0;
+            if let Some(projectm) = self.projectm_texture.as_ref().filter(|_| projectm_ready) {
                 draw_texture_ex(
                     projectm,
                     view_x,
@@ -348,21 +392,19 @@ impl MediaPlayerState {
                     },
                 );
             } else {
-                draw_rectangle(
-                    view_x,
-                    view_y,
-                    view_w,
-                    view_h,
-                    Color::new(0.005, 0.0, 0.04, 1.0),
-                );
+                Self::draw_neon_cabinet_bars(view_x, view_y, view_w, view_h);
             }
 
-            // Redraw only the cabinet's laser rim after projectM. The projectM
-            // frame has transparent rounded corners, so the visual stays
-            // inside the glass and the cabinet bezel always remains on top.
+            // Redraw the cabinet around the projectM opening after projectM.
+            // This puts the physical cabinet, glass surround and laser rim
+            // above the visualization at every output resolution.
             let cabinet_w = self.jukebox_cabinet.width();
             let cabinet_h = self.jukebox_cabinet.height();
-            let bands = [
+            let overlay_regions = [
+                Rect::new(0.0, 0.0, 640.0, 73.0),
+                Rect::new(0.0, 264.0, 640.0, 96.0),
+                Rect::new(0.0, 73.0, 149.0, 191.0),
+                Rect::new(490.0, 73.0, 150.0, 191.0),
                 Rect::new(142.0, 66.0, 355.0, 14.0),
                 Rect::new(142.0, 257.0, 355.0, 14.0),
                 Rect::new(142.0, 80.0, 14.0, 177.0),
@@ -372,7 +414,7 @@ impl MediaPlayerState {
                 Rect::new(142.0, 235.0, 36.0, 36.0),
                 Rect::new(461.0, 235.0, 36.0, 36.0),
             ];
-            for band in bands {
+            for band in overlay_regions {
                 let source = Rect::new(
                     band.x / 640.0 * cabinet_w,
                     band.y / 360.0 * cabinet_h,
@@ -450,5 +492,60 @@ impl MediaPlayerState {
             screen_height() * 0.58,
             body_size,
         );
+    }
+
+    fn draw_neon_cabinet_bars(x: f32, y: f32, width: f32, height: f32) {
+        draw_rectangle(x, y, width, height, Color::new(0.004, 0.0, 0.035, 1.0));
+
+        // The original PlayFusion cabinet effect: purple/magenta equalizer
+        // bars with cyan highlights. It is deliberately rendered by the menu
+        // itself, so it remains fast and resolution-independent and cannot
+        // escape into a separate fullscreen window.
+        let time = get_time() as f32;
+        let bar_count = 42usize;
+        let gap = (width * 0.0045).max(1.0);
+        let bar_width = (width - gap * (bar_count as f32 + 1.0)) / bar_count as f32;
+        let baseline = y + height * 0.91;
+        let max_height = height * 0.78;
+
+        for index in 0..bar_count {
+            let phase = index as f32 * 0.43;
+            let slow = (time * 2.25 + phase).sin() * 0.5 + 0.5;
+            let beat = (time * 5.6 - phase * 1.7).sin().abs();
+            let shimmer = (time * 11.0 + phase * 2.3).sin() * 0.5 + 0.5;
+            let center = 1.0 - (((index as f32 / (bar_count - 1) as f32) - 0.5).abs() * 1.15);
+            let level = (0.12 + slow * 0.36 + beat * 0.30 + shimmer * 0.10)
+                * center.clamp(0.45, 1.0);
+            let bar_height = (max_height * level).clamp(height * 0.08, max_height);
+            let bx = x + gap + index as f32 * (bar_width + gap);
+            let by = baseline - bar_height;
+            let mix = index as f32 / (bar_count - 1) as f32;
+            let color = Color::new(
+                0.30 + 0.70 * mix,
+                0.08 + 0.18 * (1.0 - mix),
+                1.0,
+                0.96,
+            );
+
+            draw_rectangle(
+                bx - gap * 0.65,
+                by - gap,
+                bar_width + gap * 1.3,
+                bar_height + gap,
+                Color::new(color.r, color.g, color.b, 0.13),
+            );
+            draw_rectangle(bx, by, bar_width, bar_height, color);
+            draw_rectangle(
+                bx,
+                by,
+                bar_width,
+                (bar_height * 0.08).max(1.0),
+                Color::new(0.20, 0.95, 1.0, 0.95),
+            );
+        }
+
+        let sweep = y + ((time * 0.18).fract() * height);
+        draw_rectangle(x, sweep, width, (height * 0.007).max(1.0), Color::new(0.2, 0.8, 1.0, 0.18));
+        draw_line(x, baseline, x + width, baseline, (height * 0.008).max(1.0), Color::new(1.0, 0.1, 0.9, 0.85));
     }
 }

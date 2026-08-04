@@ -81,7 +81,7 @@ impl Default for Config {
             bgm_track: None,
             sfx_pack: "Default".to_string(),
             logo_selection: "PlayFusion (Default)".to_string(),
-            background_selection: "Retro Laser Grid".to_string(),
+            background_selection: "ProjectM Fusion".to_string(),
             font_selection: "Default".to_string(),
         }
     }

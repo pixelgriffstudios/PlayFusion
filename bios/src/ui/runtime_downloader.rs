@@ -26,6 +26,7 @@ const ITEMS_PER_PAGE: usize = 5;
 /// Represents the source of the runtime for categorization
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum RuntimeSource {
+    PlayFusion, // From pixelgriffstudios/PlayFusion-Runtimes
     Official,   // From kazetaos/kazeta
     Outcaster,  // From the-outcaster/kazeta-plus (kzr)
     ThirdParty, // From the-outcaster/kazeta-plus (zip)
@@ -124,29 +125,32 @@ fn get_runtime_dir() -> PathBuf {
             .unwrap_or_else(|| PathBuf::from("."))
             .join("runtimes")
     } else {
-        // Prod path: /usr/share/kazeta/runtimes/
-        PathBuf::from("/usr/share/kazeta/runtimes")
+        // Persistent, writable storage for downloaded runtimes.
+        PathBuf::from("/var/kazeta/runtimes")
     }
 }
 
 /// Scans the runtime directory for installed files and extracted folders.
 fn get_installed_runtime_files() -> HashSet<String> {
-    let runtimes_dir = get_runtime_dir();
-    if let Ok(entries) = fs::read_dir(runtimes_dir) {
-        return entries
-            .flatten()
-            .filter_map(|entry| {
+    let mut installed = HashSet::new();
+    let runtime_dirs = if DEV_MODE {
+        vec![get_runtime_dir()]
+    } else {
+        vec![get_runtime_dir(), PathBuf::from("/usr/share/kazeta/runtimes")]
+    };
+    for runtimes_dir in runtime_dirs {
+        if let Ok(entries) = fs::read_dir(runtimes_dir) {
+            installed.extend(entries.flatten().filter_map(|entry| {
                 let path = entry.path();
-                // Check for both files (e.g., "psx.kzr") and directories (e.g., "pcengine")
                 if path.is_file() || path.is_dir() {
                     entry.file_name().into_string().ok()
                 } else {
                     None
                 }
-            })
-            .collect();
+            }));
+        }
     }
-    HashSet::new()
+    installed
 }
 
 pub fn update(
@@ -471,6 +475,7 @@ pub fn draw(
 
                 // Add a prefix based on the source
                 let source_prefix = match runtime.source {
+                    RuntimeSource::PlayFusion => "[PlayFusion]",
                     RuntimeSource::Official => "[Official]",
                     RuntimeSource::Outcaster => "[Kazeta+]",
                     RuntimeSource::ThirdParty => "[Third-Party]",
@@ -884,7 +889,43 @@ fn fetch_runtime_list(tx: Sender<DownloaderMessage>) {
             eprintln!("[Runtime] Failed to fetch kazeta-plus releases");
         }
 
-        // --- 3. Sort and Check Installation Status ---
+        // --- 3. Fetch PlayFusion runtimes ---
+        // This catalog contains the extra systems shipped by PlayFusion and
+        // is also what lets a Lite installation add only the runtimes wanted.
+        let response_playfusion = client
+            .get("https://api.github.com/repos/pixelgriffstudios/PlayFusion-Runtimes/releases/latest")
+            .send();
+        if let Ok(resp) = response_playfusion {
+            if let Ok(release) = resp.json::<GithubRelease>() {
+                for asset in release.assets {
+                    let lower_name = asset.name.to_ascii_lowercase();
+                    if !lower_name.ends_with(".kzr") && !lower_name.ends_with(".zip") {
+                        continue;
+                    }
+                    // Prefer the PlayFusion catalog when another repository
+                    // publishes an asset with the same filename.
+                    all_runtimes.retain(|runtime| runtime.file_name != asset.name);
+                    let size_mb = get_remote_file_size(&client, &asset.browser_download_url);
+                    all_runtimes.push(RemoteRuntime {
+                        name: asset.name.clone(),
+                        file_name: asset.name,
+                        description: "PlayFusion runtime. Firmware, BIOS files and console keys remain user-supplied."
+                            .to_string(),
+                        download_url: asset.browser_download_url,
+                        source: RuntimeSource::PlayFusion,
+                        is_installed: false,
+                        is_zip: lower_name.ends_with(".zip"),
+                        size_mb,
+                    });
+                }
+            } else {
+                eprintln!("[Runtime] Failed to parse PlayFusion runtime release JSON");
+            }
+        } else {
+            eprintln!("[Runtime] Failed to fetch PlayFusion runtime release");
+        }
+
+        // --- 4. Sort and Check Installation Status ---
         all_runtimes.sort_by_key(|r| (r.source.clone(), r.name.clone()));
 
         let installed_files = get_installed_runtime_files();

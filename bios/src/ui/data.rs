@@ -1,5 +1,5 @@
 use crate::audio::SoundEffects;
-use crate::ui::{draw_configured_cursor_frame, draw_playfusion_panel_frame};
+use crate::ui::{draw_configured_cursor_frame, draw_themed_panel_frame};
 use crate::{memory::*, ui::dialog::*, *}; // Use wildcards for convenience or specify each type
 use futures;
 use std::panic;
@@ -539,7 +539,9 @@ pub fn draw(
                         UI_BG_COLOR,
                     );
                 }
-                draw_playfusion_panel_frame(
+                draw_themed_panel_frame(
+                    config,
+                    animation_state,
                     pos_x - (2.0 * scale_factor),
                     pos_y - (2.0 * scale_factor),
                     tile_size + (4.0 * scale_factor),
@@ -620,7 +622,9 @@ pub fn draw(
             storage_info_h,
             UI_BG_COLOR,
         );
-        draw_playfusion_panel_frame(
+        draw_themed_panel_frame(
+            config,
+            animation_state,
             storage_info_x - box_line_thickness,
             storage_info_y - box_line_thickness,
             storage_info_w + (box_line_thickness * 2.0),
@@ -836,7 +840,9 @@ pub fn draw(
             40.0 * scale_factor,
             UI_BG_COLOR,
         );
-        draw_playfusion_panel_frame(
+        draw_themed_panel_frame(
+            config,
+            animation_state,
             save_info_x - (4.0 * scale_factor),
             save_info_y - (4.0 * scale_factor),
             save_box_w + (8.0 * scale_factor),

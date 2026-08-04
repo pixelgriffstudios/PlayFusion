@@ -1,8 +1,8 @@
 use crate::{
     audio::SoundEffects,
     config::{get_user_data_dir, Config},
-    get_current_font, render_background, text_with_config_color, wrap_text, BackgroundState,
-    InputState, Screen, VideoPlayer, FONT_SIZE,
+    draw_configured_cursor_frame, get_current_font, render_background, text_with_config_color,
+    wrap_text, BackgroundState, InputState, Screen, VideoPlayer, FONT_SIZE,
 };
 use macroquad::prelude::*;
 use regex::Regex;
@@ -18,8 +18,9 @@ use std::{
 use toml;
 
 // --- CONSTANTS ---
-const ITEMS_PER_PAGE: usize = 5;
+const ITEMS_PER_PAGE: usize = 4;
 const TOOL_OPTION_COUNT: usize = 5;
+const MAX_THEME_PREVIEW_BYTES: usize = 8 * 1024 * 1024;
 
 // --- State Management & Structs ---
 
@@ -57,14 +58,15 @@ enum DownloaderMessage {
     ConversionResult(Result<String, String>), // -- NEW -- For audio conversion success/error
 }
 
-#[derive(Deserialize, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct RemoteTheme {
     pub name: String,        // Display name, e.g., "Soul Calibur II"
     pub folder_name: String, // Directory name, e.g., "soul_calibur_ii"
     pub author: String,
     pub description: String,
     pub download_url: String,
-    #[serde(default)]
+    pub source: String,
+    pub preview_bytes: Option<Vec<u8>>,
     pub is_installed: bool,
 }
 
@@ -94,6 +96,7 @@ pub struct ThemeDownloaderState {
     tx: Sender<DownloaderMessage>,
     pub has_audio_tools_option: bool,
     pub current_page: usize,
+    preview_textures: HashMap<String, Texture2D>,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +125,7 @@ impl ThemeDownloaderState {
             tx,
             has_audio_tools_option: true,
             current_page: 0,
+            preview_textures: HashMap::new(),
         }
     }
 
@@ -166,6 +170,9 @@ pub fn update(
                 for theme in themes.iter_mut() {
                     if installed_themes.contains(&theme.folder_name) {
                         theme.is_installed = true;
+                        if theme.preview_bytes.is_none() {
+                            theme.preview_bytes = local_theme_preview(&theme.folder_name);
+                        }
                     }
                 }
 
@@ -181,6 +188,17 @@ pub fn update(
                     left.name.to_lowercase().cmp(&right.name.to_lowercase())
                 });
 
+                state.preview_textures.clear();
+                for theme in themes.iter_mut() {
+                    if let Some(bytes) = theme.preview_bytes.take() {
+                        let texture = Texture2D::from_file_with_format(&bytes, None);
+                        texture.set_filter(FilterMode::Linear);
+                        state
+                            .preview_textures
+                            .insert(theme.folder_name.clone(), texture);
+                    }
+                }
+
                 state.themes = themes;
                 state.screen_state = DownloaderState::DisplayingList;
             }
@@ -192,6 +210,16 @@ pub fn update(
                     .into_iter()
                     .map(|folder_name| local_theme_entry(&folder_name))
                     .collect();
+                state.preview_textures.clear();
+                for theme in state.themes.iter_mut() {
+                    if let Some(bytes) = theme.preview_bytes.take() {
+                        let texture = Texture2D::from_file_with_format(&bytes, None);
+                        texture.set_filter(FilterMode::Linear);
+                        state
+                            .preview_textures
+                            .insert(theme.folder_name.clone(), texture);
+                    }
+                }
                 state.themes.sort_by(|left, right| {
                     left.name.to_lowercase().cmp(&right.name.to_lowercase())
                 });
@@ -233,33 +261,21 @@ pub fn update(
                 return;
             }
 
-            let total_pages = (total_options + ITEMS_PER_PAGE - 1) / ITEMS_PER_PAGE;
-
+            let old_selection = state.selected_index;
             if input_state.down {
-                if state.selected_index < total_options - 1 {
-                    state.selected_index += 1;
-                    sound_effects.play_cursor_move(config);
-                }
+                state.selected_index = (state.selected_index + 2).min(total_options - 1);
             }
             if input_state.up {
-                if state.selected_index > 0 {
-                    state.selected_index -= 1;
-                    sound_effects.play_cursor_move(config);
-                }
+                state.selected_index = state.selected_index.saturating_sub(2);
             }
             if input_state.right {
-                if state.current_page < total_pages - 1 {
-                    state.current_page += 1;
-                    state.selected_index = state.current_page * ITEMS_PER_PAGE;
-                    sound_effects.play_cursor_move(config);
-                }
+                state.selected_index = (state.selected_index + 1).min(total_options - 1);
             }
             if input_state.left {
-                if state.current_page > 0 {
-                    state.current_page -= 1;
-                    state.selected_index = state.current_page * ITEMS_PER_PAGE;
-                    sound_effects.play_cursor_move(config);
-                }
+                state.selected_index = state.selected_index.saturating_sub(1);
+            }
+            if state.selected_index != old_selection {
+                sound_effects.play_cursor_move(config);
             }
 
             // Auto-update current page based on selection
@@ -561,52 +577,190 @@ pub fn draw(
             let start_index = state.current_page * ITEMS_PER_PAGE;
             let end_index = (start_index + ITEMS_PER_PAGE).min(total_options);
 
-            // Draw items for the current page
+            // Controller-friendly 2x2 gallery. Remote themes use a branded
+            // fallback tile; installed themes can still supply their own
+            // backgrounds and folder artwork once applied.
+            let grid_x = container_x + container_w * 0.04;
+            let grid_y = container_y + container_h * 0.10;
+            let grid_w = container_w * 0.92;
+            let grid_h = container_h * 0.47;
+            let gap_x = container_w * 0.025;
+            let gap_y = container_h * 0.025;
+            let card_w = (grid_w - gap_x) * 0.5;
+            let card_h = (grid_h - gap_y) * 0.5;
+            let card_font_size = (font_size as f32 * 0.68).max(9.0) as u16;
+            let source_font_size = (font_size as f32 * 0.52).max(8.0) as u16;
             for i in start_index..end_index {
                 let item_on_page = i - start_index;
-                let y_pos = text_y_start + (item_on_page as f32 * line_height) + 20.0;
-
-                if i == state.selected_index {
-                    let cursor_color = animation_state.get_cursor_color(config);
-                    draw_rectangle(
-                        container_x,
-                        y_pos - font_size as f32 - 5.0,
-                        container_w,
-                        line_height,
-                        Color::new(cursor_color.r, cursor_color.g, cursor_color.b, 0.3),
-                    );
-                }
-
-                let display_text = if i < state.themes.len() {
+                let column = item_on_page % 2;
+                let row = item_on_page / 2;
+                let card_x = grid_x + column as f32 * (card_w + gap_x);
+                let card_y = grid_y + row as f32 * (card_h + gap_y);
+                let is_selected = i == state.selected_index;
+                let (display_text, source_text, installed_text, tile_color) = if i < state.themes.len() {
                     let theme = &state.themes[i];
                     let installed_flag = if config.theme == theme.folder_name {
-                        " [ACTIVE]"
+                        "ACTIVE"
                     } else if theme.is_installed {
-                        " [INSTALLED]"
+                        "INSTALLED"
                     } else {
                         ""
                     };
-                    format!("{} by {}{}", theme.name, theme.author, installed_flag)
+                    let color = if theme.source == "PlayFusion" {
+                        Color::new(0.45, 0.03, 0.62, 0.92)
+                    } else if theme.source == "Kazeta+" {
+                        Color::new(0.02, 0.28, 0.48, 0.92)
+                    } else {
+                        Color::new(0.20, 0.20, 0.28, 0.92)
+                    };
+                    (
+                        theme.name.clone(),
+                        format!("{} - {}", theme.source, theme.author),
+                        installed_flag.to_string(),
+                        color,
+                    )
                 } else {
                     let tool_index = i - state.themes.len();
-                    if tool_index == 0 {
-                        "Import Theme from USB / SD".to_string()
+                    let name = if tool_index == 0 {
+                        "IMPORT FROM USB / SD"
                     } else if tool_index == 1 {
-                        "Reset to PlayFusion Default Theme".to_string()
+                        "RESTORE DEFAULT"
                     } else if tool_index == 2 {
-                        "Audio Tools: Convert .OGG to .WAV".to_string()
+                        "CONVERT OGG TO WAV"
                     } else if tool_index == 3 {
-                        "Audio Tools: Convert .WAV to .OGG".to_string()
+                        "CONVERT WAV TO OGG"
                     } else {
-                        "Audio Tools: Delete All BGM Tracks".to_string()
-                    } // New option
+                        "DELETE THEME BGM"
+                    };
+                    (
+                        name.to_string(),
+                        "THEME TOOL".to_string(),
+                        String::new(),
+                        Color::new(0.34, 0.08, 0.38, 0.92),
+                    )
                 };
-                text_with_config_color(font_cache, config, &display_text, text_x, y_pos, font_size);
+
+                draw_rectangle(card_x, card_y, card_w, card_h, tile_color);
+                let content_x = card_x + 3.0 * scale_factor;
+                let content_y = card_y + 3.0 * scale_factor;
+                let content_w = card_w - 6.0 * scale_factor;
+                let content_h = card_h - 6.0 * scale_factor;
+                let preview = if i < state.themes.len() {
+                    state
+                        .preview_textures
+                        .get(&state.themes[i].folder_name)
+                } else {
+                    None
+                };
+                if let Some(texture) = preview {
+                    let texture_aspect = texture.width() / texture.height().max(1.0);
+                    let card_aspect = content_w / content_h.max(1.0);
+                    let source = if texture_aspect > card_aspect {
+                        let source_w = texture.height() * card_aspect;
+                        Rect::new(
+                            (texture.width() - source_w) * 0.5,
+                            0.0,
+                            source_w,
+                            texture.height(),
+                        )
+                    } else {
+                        let source_h = texture.width() / card_aspect;
+                        Rect::new(
+                            0.0,
+                            (texture.height() - source_h) * 0.5,
+                            texture.width(),
+                            source_h,
+                        )
+                    };
+                    draw_texture_ex(
+                        texture,
+                        content_x,
+                        content_y,
+                        WHITE,
+                        DrawTextureParams {
+                            dest_size: Some(vec2(content_w, content_h)),
+                            source: Some(source),
+                            ..Default::default()
+                        },
+                    );
+                    draw_rectangle(
+                        content_x,
+                        content_y,
+                        content_w,
+                        content_h,
+                        Color::new(0.0, 0.0, 0.0, 0.44),
+                    );
+                } else {
+                    draw_rectangle(
+                        content_x,
+                        content_y,
+                        content_w,
+                        content_h,
+                        Color::new(0.01, 0.0, 0.06, 0.72),
+                    );
+                }
+                if is_selected {
+                    draw_configured_cursor_frame(
+                        config,
+                        animation_state,
+                        card_x - 2.0 * scale_factor,
+                        card_y - 2.0 * scale_factor,
+                        card_w + 4.0 * scale_factor,
+                        card_h + 4.0 * scale_factor,
+                        3.0 * scale_factor,
+                    );
+                }
+
+                let badge = if i < state.themes.len() { "THEME" } else { "TOOLS" };
+                let badge_dims = measure_text(badge, Some(font), source_font_size, 1.0);
+                text_with_config_color(
+                    font_cache,
+                    config,
+                    badge,
+                    card_x + (card_w - badge_dims.width) * 0.5,
+                    card_y + card_h * 0.26,
+                    source_font_size,
+                );
+                let name_lines = wrap_text(
+                    display_text.trim(),
+                    font.clone(),
+                    card_font_size,
+                    card_w - 24.0 * scale_factor,
+                );
+                for (line_index, line) in name_lines.iter().take(2).enumerate() {
+                    let dims = measure_text(line, Some(font), card_font_size, 1.0);
+                    text_with_config_color(
+                        font_cache,
+                        config,
+                        line,
+                        card_x + (card_w - dims.width) * 0.5,
+                        card_y + card_h * 0.55 + line_index as f32 * card_font_size as f32 * 1.1,
+                        card_font_size,
+                    );
+                }
+                let source_dims = measure_text(&source_text, Some(font), source_font_size, 1.0);
+                text_with_config_color(
+                    font_cache,
+                    config,
+                    &source_text,
+                    card_x + ((card_w - source_dims.width) * 0.5).max(5.0 * scale_factor),
+                    card_y + card_h - 10.0 * scale_factor,
+                    source_font_size,
+                );
+                if !installed_text.is_empty() {
+                    text_with_config_color(
+                        font_cache,
+                        config,
+                        &installed_text,
+                        card_x + 8.0 * scale_factor,
+                        card_y + 14.0 * scale_factor,
+                        source_font_size,
+                    );
+                }
             }
 
             // Draw description panel
-            let separator_y =
-                text_y_start + (ITEMS_PER_PAGE as f32 * line_height) + (line_height / 2.0);
+            let separator_y = container_y + container_h * 0.62;
             draw_line(
                 container_x,
                 separator_y,
@@ -633,7 +787,7 @@ pub fn draw(
                 if tool_index == 0 {
                     "Imports compatible PlayFusion or Kazeta+ theme folders and safe ZIP files from USB/SD.\n\nOptional system-folders artwork is preserved; older themes continue to use built-in folder covers.".to_string()
                 } else if tool_index == 1 {
-                    "Restores the built-in PlayFusion logo, Retro Laser Grid background, font, colors, cursor and sounds.\n\nResolution, audio, profiles, network and other system settings are preserved.".to_string()
+                    "Restores the built-in PlayFusion logo, ProjectM Fusion background, font, colors, cursor and sounds.\n\nResolution, audio, profiles, network and other system settings are preserved.".to_string()
                 } else if tool_index == 2 {
                     "Converts space-saving .ogg files into faster-loading .wav files.\n\nThis uses more disk space.".to_string()
                 } else if tool_index == 3 {
@@ -1023,53 +1177,106 @@ fn import_themes_from_usb(tx: Sender<DownloaderMessage>) {
 
 fn fetch_theme_list(tx: Sender<DownloaderMessage>) {
     thread::spawn(move || {
+        // Build missing gallery thumbnails off the UI thread. Video themes
+        // are decoded once after installation and then use the cached PNG.
+        for folder_name in get_installed_theme_folders() {
+            let _ = ensure_video_theme_preview(&folder_name);
+        }
         let client = reqwest::blocking::Client::builder()
-            .user_agent("KazetaPlus-Theme-Downloader")
+            .user_agent("PlayFusion-Theme-Manager")
             .build()
             .unwrap();
-        let response = client
-            .get("https://api.github.com/repos/the-outcaster/kazeta-plus-themes/releases")
-            .send();
-        let result = match response {
-            Ok(resp) => match resp.json::<Vec<GithubRelease>>() {
-                Ok(releases) => {
-                    let themes: Vec<RemoteTheme> = releases
-                        .into_iter()
-                        .filter_map(|release| {
-                            release
-                                .assets
-                                .iter()
-                                .find(|asset| asset.name.ends_with(".zip"))
-                                .map(|asset| {
-                                    let author = release
-                                        .body
-                                        .lines()
-                                        .find(|line| line.to_lowercase().starts_with("author:"))
-                                        .map(|line| {
-                                            line.split(':').nth(1).unwrap_or("").trim().to_string()
-                                        })
-                                        .unwrap_or_else(|| "Unknown".to_string());
-                                    let folder_name = asset
-                                        .name
-                                        .strip_suffix(".zip")
-                                        .unwrap_or(&asset.name)
-                                        .to_string();
-                                    RemoteTheme {
-                                        name: release.name,
-                                        folder_name,
-                                        author,
-                                        description: release.body,
-                                        download_url: asset.browser_download_url.clone(),
-                                        is_installed: false,
-                                    }
-                                })
-                        })
-                        .collect();
-                    Ok(themes)
+        let repositories = [
+            (
+                "PlayFusion",
+                "https://api.github.com/repos/pixelgriffstudios/PlayFusion-Themes/releases",
+            ),
+            (
+                "Kazeta+",
+                "https://api.github.com/repos/the-outcaster/kazeta-plus-themes/releases",
+            ),
+        ];
+        let mut themes: Vec<RemoteTheme> = Vec::new();
+        let mut successful_repositories = 0usize;
+        for (source, url) in repositories {
+            let Ok(response) = client.get(url).send() else {
+                eprintln!("[Theme Manager] Unable to fetch {source} theme catalog");
+                continue;
+            };
+            let Ok(releases) = response.json::<Vec<GithubRelease>>() else {
+                eprintln!("[Theme Manager] Unable to parse {source} theme catalog");
+                continue;
+            };
+            successful_repositories += 1;
+            for release in releases {
+                for asset in release
+                    .assets
+                    .iter()
+                    .filter(|asset| asset.name.to_ascii_lowercase().ends_with(".zip"))
+                {
+                    let author = release
+                        .body
+                        .lines()
+                        .find(|line| line.to_lowercase().starts_with("author:"))
+                        .map(|line| line.split(':').nth(1).unwrap_or("").trim().to_string())
+                        .unwrap_or_else(|| {
+                            if source == "PlayFusion" {
+                                "PixelGriff Studios".to_string()
+                            } else {
+                                "Kazeta+ community".to_string()
+                            }
+                        });
+                    let folder_name = asset
+                        .name
+                        .strip_suffix(".zip")
+                        .unwrap_or(&asset.name)
+                        .to_string();
+                    let name = if release.assets.len() == 1 {
+                        release.name.clone()
+                    } else {
+                        folder_name
+                            .split(['_', '-'])
+                            .filter(|part| !part.is_empty())
+                            .map(|part| {
+                                let mut chars = part.chars();
+                                chars
+                                    .next()
+                                    .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                                    .unwrap_or_default()
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    };
+                    let remote_theme = RemoteTheme {
+                        name,
+                        folder_name: folder_name.clone(),
+                        author,
+                        description: release.body.clone(),
+                        download_url: asset.browser_download_url.clone(),
+                        source: source.to_string(),
+                        preview_bytes: find_remote_preview_asset(&release.assets, &asset.name)
+                            .and_then(|preview_asset| {
+                                download_theme_preview(&client, preview_asset)
+                            }),
+                        is_installed: false,
+                    };
+                    if let Some(existing) = themes
+                        .iter_mut()
+                        .find(|theme| theme.folder_name == folder_name)
+                    {
+                        if source == "PlayFusion" {
+                            *existing = remote_theme;
+                        }
+                    } else {
+                        themes.push(remote_theme);
+                    }
                 }
-                Err(_) => Err("Failed to parse theme list from GitHub.".to_string()),
-            },
-            Err(_) => Err("Failed to fetch theme list from GitHub.".to_string()),
+            }
+        }
+        let result = if successful_repositories == 0 {
+            Err("Failed to fetch theme catalogs from GitHub.".to_string())
+        } else {
+            Ok(themes)
         };
         tx.send(DownloaderMessage::ThemeList(result)).unwrap();
     });
@@ -1091,6 +1298,9 @@ fn download_and_extract_theme(theme: RemoteTheme, tx: Sender<DownloaderMessage>)
             archive
                 .extract(&themes_dir)
                 .map_err(|e| format!("Failed to extract theme: {}", e))?;
+            for folder_name in get_installed_theme_folders() {
+                let _ = ensure_video_theme_preview(&folder_name);
+            }
             Ok(theme.name)
         })();
         tx.send(DownloaderMessage::InstallResult(result)).unwrap();
@@ -1260,8 +1470,184 @@ fn local_theme_entry(folder_name: &str) -> RemoteTheme {
             .description
             .unwrap_or_else(|| "Imported from USB / SD storage.".to_string()),
         download_url: String::new(),
+        source: "Local".to_string(),
+        preview_bytes: local_theme_preview(folder_name),
         is_installed: true,
     }
+}
+
+fn local_theme_preview(folder_name: &str) -> Option<Vec<u8>> {
+    let theme_dir = get_user_data_dir()?.join("themes").join(folder_name);
+    for name in ["preview.png", "preview.jpg", "preview.jpeg", "preview.webp"] {
+        if let Some(bytes) = read_theme_preview_file(&theme_dir.join(name)) {
+            return Some(bytes);
+        }
+    }
+
+    // Older themes did not define preview.png. A static theme background is a
+    // safe fallback; videos are intentionally skipped so gallery browsing
+    // never starts a decoder for every card.
+    let configured_background = fs::read_to_string(theme_dir.join("theme.toml"))
+        .ok()
+        .and_then(|content| toml::from_str::<ThemeToml>(&content).ok())
+        .and_then(|metadata| metadata.background_selection);
+    if let Some(background) = configured_background {
+        let extension = Path::new(&background)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
+            if let Some(bytes) = read_theme_preview_file(&theme_dir.join(background)) {
+                return Some(bytes);
+            }
+        }
+    }
+
+    for name in [
+        "background.png",
+        "background.jpg",
+        "background.jpeg",
+        "background.webp",
+    ] {
+        if let Some(bytes) = read_theme_preview_file(&theme_dir.join(name)) {
+            return Some(bytes);
+        }
+    }
+    None
+}
+
+fn read_theme_preview_file(path: &Path) -> Option<Vec<u8>> {
+    let metadata = fs::metadata(&path).ok()?;
+    if !metadata.is_file() || metadata.len() > MAX_THEME_PREVIEW_BYTES as u64 {
+        return None;
+    }
+    fs::read(path).ok()
+}
+
+fn ensure_video_theme_preview(folder_name: &str) -> Option<Vec<u8>> {
+    if let Some(preview) = local_theme_preview(folder_name) {
+        return Some(preview);
+    }
+
+    let theme_dir = get_user_data_dir()?.join("themes").join(folder_name);
+    let theme_dir_canonical = theme_dir.canonicalize().ok()?;
+    let metadata = fs::read_to_string(theme_dir.join("theme.toml"))
+        .ok()
+        .and_then(|content| toml::from_str::<ThemeToml>(&content).ok())
+        .unwrap_or_default();
+    let mut candidates = Vec::new();
+    if let Some(background) = metadata.background_selection {
+        candidates.push(background);
+    }
+    candidates.push("background.mp4".to_string());
+    if let Some(animation) = metadata.boot_animation {
+        candidates.push(animation);
+    }
+    candidates.push("boot_animation.mp4".to_string());
+
+    let video_path = candidates.into_iter().find_map(|candidate| {
+        let relative = Path::new(&candidate);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return None;
+        }
+        let extension = relative
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(extension.as_str(), "mp4" | "mkv" | "webm" | "mov") {
+            return None;
+        }
+        let path = theme_dir.join(relative);
+        let canonical = path.canonicalize().ok()?;
+        if canonical.starts_with(&theme_dir_canonical) && canonical.is_file() {
+            Some(canonical)
+        } else {
+            None
+        }
+    })?;
+
+    let preview_path = theme_dir.join("preview.png");
+    let temporary_path = theme_dir.join(".preview-generating.png");
+    let render_frame = |timestamp: &str| {
+        Command::new("ffmpeg")
+            .args(["-hide_banner", "-loglevel", "error", "-ss", timestamp, "-i"])
+            .arg(&video_path)
+            .args([
+                "-frames:v",
+                "1",
+                "-vf",
+                "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2:color=black",
+                "-y",
+            ])
+            .arg(&temporary_path)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    };
+    let rendered = render_frame("1.0") || render_frame("0.0");
+    if !rendered {
+        let _ = fs::remove_file(&temporary_path);
+        return None;
+    }
+    if fs::rename(&temporary_path, &preview_path).is_err() {
+        let _ = fs::remove_file(&temporary_path);
+        return None;
+    }
+    read_theme_preview_file(&preview_path)
+}
+
+fn find_remote_preview_asset<'a>(
+    assets: &'a [GithubReleaseAsset],
+    archive_name: &str,
+) -> Option<&'a GithubReleaseAsset> {
+    let archive_stem = archive_name
+        .strip_suffix(".zip")
+        .unwrap_or(archive_name)
+        .to_ascii_lowercase();
+    let supported = |name: &str| {
+        let lower = name.to_ascii_lowercase();
+        lower.ends_with(".png")
+            || lower.ends_with(".jpg")
+            || lower.ends_with(".jpeg")
+            || lower.ends_with(".webp")
+    };
+    let exact_names = [
+        format!("{archive_stem}-preview.png"),
+        format!("{archive_stem}-preview.jpg"),
+        format!("{archive_stem}-preview.jpeg"),
+        format!("{archive_stem}-preview.webp"),
+        format!("{archive_stem}.png"),
+        format!("{archive_stem}.jpg"),
+        format!("{archive_stem}.jpeg"),
+        format!("{archive_stem}.webp"),
+    ];
+    assets.iter().find(|asset| {
+        let lower = asset.name.to_ascii_lowercase();
+        supported(&lower) && exact_names.iter().any(|candidate| candidate == &lower)
+    })
+}
+
+fn download_theme_preview(
+    client: &reqwest::blocking::Client,
+    asset: &GithubReleaseAsset,
+) -> Option<Vec<u8>> {
+    let response = client.get(&asset.browser_download_url).send().ok()?;
+    if let Some(length) = response.content_length() {
+        if length > MAX_THEME_PREVIEW_BYTES as u64 {
+            return None;
+        }
+    }
+    let bytes = response.bytes().ok()?;
+    if bytes.len() > MAX_THEME_PREVIEW_BYTES {
+        return None;
+    }
+    Some(bytes.to_vec())
 }
 
 /// Scans the user's themes directory and returns a HashSet of installed theme folder names.

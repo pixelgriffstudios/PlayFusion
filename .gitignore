@@ -21,8 +21,15 @@ __pycache__/
 .pseudo-test/
 .network-library-test/
 .remote-current-src/
+.release-vm/
 .tools/
 physical-disk*-inspection.json
+tools/projectm4-*-frame.png
+tools/projectm4-*-frame.ppm
+tools/projectm4-smoke.png
+tools/projectm4-smoke.ppm
+tools/android-cart-metadata/
+tools/deploy-android-test-carts.sh
 
 # Image, VM, and release build products
 image-build/

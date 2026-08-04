@@ -3,7 +3,7 @@
 
 set -euo pipefail
 
-TARGET_DIR="/usr/share/kazeta/runtimes"
+TARGET_DIR="/var/kazeta/runtimes"
 ACTION=$1
 SOURCE_FILE=""
 TARGET_NAME=""

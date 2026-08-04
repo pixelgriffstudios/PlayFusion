@@ -1,15 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
 # Capture the known-good PlayFusion deployment without altering its low-level
 # Kazeta release identity.  The UI remains PlayFusion-branded, while the boot
 # and session layer stays byte-for-byte compatible with the working console.
 
-SOURCE_SUBVOL="/frzr_root/deployments/kazeta-2025-0_545b900"
-BUILD_ROOT="/frzr_root/playfusion-release-build"
-SNAP_NAME="kazeta-2025-0_545b900"
+FLAVOR=${PLAYFUSION_FLAVOR:-full}
+case "$FLAVOR" in
+    full|lite) ;;
+    *) echo "PLAYFUSION_FLAVOR must be full or lite" >&2; exit 2 ;;
+esac
+
+SOURCE_SUBVOL="/frzr_root/deployments/playfusion-1.0-public"
+BUILD_ROOT="/frzr_root/playfusion-release-build-${FLAVOR}"
+SNAP_NAME="playfusion-1.0-public"
 SNAPSHOT="${BUILD_ROOT}/${SNAP_NAME}"
-OUTPUT_DIR="/var/tmp/playfusion-release-output"
+OUTPUT_DIR="/var/tmp/playfusion-release-output-${FLAVOR}"
 STREAM="${OUTPUT_DIR}/${SNAP_NAME}.img"
 ARCHIVE="${OUTPUT_DIR}/${SNAP_NAME}.img.tar.xz"
 SEED="${OUTPUT_DIR}/playfusion-seed"
@@ -17,8 +25,8 @@ SEED="${OUTPUT_DIR}/playfusion-seed"
 test "$(id -u)" -eq 0
 test -d "${SOURCE_SUBVOL}"
 test "$(findmnt -n -o FSTYPE /frzr_root)" = "btrfs"
-test "$(realpath -m "${BUILD_ROOT}")" = "/frzr_root/playfusion-release-build"
-test "$(realpath -m "${OUTPUT_DIR}")" = "/var/tmp/playfusion-release-output"
+test "$(realpath -m "${BUILD_ROOT}")" = "/frzr_root/playfusion-release-build-${FLAVOR}"
+test "$(realpath -m "${OUTPUT_DIR}")" = "/var/tmp/playfusion-release-output-${FLAVOR}"
 
 mkdir -p "${BUILD_ROOT}" "${OUTPUT_DIR}"
 
@@ -66,6 +74,24 @@ rm -f -- "${SNAPSHOT}"/etc/ssh/ssh_host_*
 rm -f -- "${SNAPSHOT}"/etc/NetworkManager/system-connections/* 2>/dev/null || true
 chown -R 1000:1000 "${HOME_DIR}"
 
+printf 'PRODUCT=PlayFusion\nVERSION=1.0.3\n' > "${SNAPSHOT}/etc/playfusion-release"
+install -d -m 0755 "${SNAPSHOT}/etc/systemd/system/graphical.target.wants"
+ln -sfn ../playfusion-update-health.service \
+    "${SNAPSHOT}/etc/systemd/system/graphical.target.wants/playfusion-update-health.service"
+
+# Full media bundles every currently installed public runtime, including the
+# separately downloaded Windows 1.2 runtime. Lite media intentionally keeps
+# only none.kzr, the tiny no-runtime sentinel used by the launcher.
+RUNTIME_DIR="${SNAPSHOT}/usr/share/kazeta/runtimes"
+mkdir -p "${RUNTIME_DIR}"
+if [[ "$FLAVOR" == full ]]; then
+    find /var/kazeta/runtimes -maxdepth 1 -type f -name '*.kzr' \
+        -exec install -m 0644 {} "${RUNTIME_DIR}/" \; 2>/dev/null || true
+else
+    find "${RUNTIME_DIR}" -maxdepth 1 -type f -name '*.kzr' \
+        ! -name none.kzr -delete
+fi
+
 echo "[3/6] Building a metadata-preserving factory data seed..."
 mkdir -p "${SEED}"
 cp -a --reflink=auto /var/kazeta/. "${SEED}/"
@@ -73,9 +99,17 @@ chown --reference=/var/kazeta "${SEED}"
 chmod --reference=/var/kazeta "${SEED}"
 touch --reference=/var/kazeta "${SEED}"
 
+# Firmware and decryption keys on the development console are private input
+# supplied by the owner.  Keep the directory layout so BIOS Manager can import
+# authorized files after installation, but never publish the files themselves.
+mkdir -p "${SEED}/firmware"
+find "${SEED}/firmware" -mindepth 1 -delete
+mkdir -p "${SEED}/runtimes"
+find "${SEED}/runtimes" -mindepth 1 -delete
+
 # Ship the two approved Xbox themes, but do not publish downloaded test themes
 # or the developer console's current selection. The factory UI remains the
-# resolution-safe Retro Laser Grid and users may opt into either Xbox theme.
+# native-resolution ProjectM Fusion and users may opt into other themes.
 THEME_ROOT="${SEED}/user-data/kazeta-plus/themes"
 if test -d "${THEME_ROOT}"; then
     find "${THEME_ROOT}" -mindepth 1 -maxdepth 1 -type d \
@@ -89,7 +123,7 @@ sed -i \
     -e 's/^audio_output = .*/audio_output = "Auto"/' \
     -e 's/^theme = .*/theme = "Default"/' \
     -e 's/^profile_badge_position = .*/profile_badge_position = "RIGHT"/' \
-    -e 's/^background_selection = .*/background_selection = "Retro Laser Grid"/' \
+    -e 's/^background_selection = .*/background_selection = "ProjectM Fusion"/' \
     "${CONFIG}"
 
 # Keep only the approved public games.
@@ -99,6 +133,10 @@ cp -a /var/kazeta/internal-games/Arcade/internal-playfusion-arcade \
     "${SEED}/internal-games/Arcade/"
 cp -a "/var/kazeta/internal-games/PC Games/internal-hell-on-rails" \
     "${SEED}/internal-games/PC Games/"
+
+# No approved public game may smuggle firmware or keys inside its cart folder.
+find "${SEED}/internal-games" -type d -iname bios -prune \
+    -exec find {} -mindepth 1 -delete \;
 
 # Keep only the approved public album and no personal movies.
 find "${SEED}/music" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
@@ -151,7 +189,13 @@ chmod 0644 "${SEED}/active-profile" "${SEED}/profiles/default.toml" \
     "${SEED}/state/playfusion-favorites"
 
 echo "[4/6] Verifying release contents and boot identity..."
-test "$(find "${SNAPSHOT}/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39
+if [[ "$FLAVOR" == full ]]; then
+    test "$(find "${RUNTIME_DIR}" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39
+    test -s "${RUNTIME_DIR}/windows-1.2-experimental.kzr"
+else
+    test "$(find "${RUNTIME_DIR}" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 1
+    test -s "${RUNTIME_DIR}/none.kzr"
+fi
 test -f "${SEED}/internal-games/Arcade/internal-playfusion-arcade/cart.kzi"
 test -f "${SEED}/internal-games/PC Games/internal-hell-on-rails/cart.kzi"
 test -d "${SEED}/music/30 years"
@@ -163,10 +207,13 @@ done
 test "$(find "${THEME_ROOT}" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2
 grep -q '^resolution = "1280x720"$' "${CONFIG}"
 grep -q '^theme = "Default"$' "${CONFIG}"
-grep -q '^background_selection = "Retro Laser Grid"$' "${CONFIG}"
-test -n "$(find "${SEED}/firmware" -type f -print -quit)"
+grep -q '^background_selection = "ProjectM Fusion"$' "${CONFIG}"
+test -z "$(find "${SEED}/firmware" -type f -print -quit)"
 test "$(find "${SEED}/internal-games" -mindepth 2 -maxdepth 2 -type d | wc -l)" -eq 2
 test "$(head -n 1 "${SNAPSHOT}/build_info")" = "${SNAP_NAME}"
+grep -qx 'VERSION=1.0.3' "${SNAPSHOT}/etc/playfusion-release"
+"${SCRIPT_DIR}/verify-public-rootfs.sh" "${SNAPSHOT}"
+"${SCRIPT_DIR}/verify-public-rootfs.sh" "${SEED}"
 
 # A nodatacow target cannot accept inherited btrfs compression properties.
 # Fail the release build before creating an installer if any future staging
@@ -184,7 +231,7 @@ btrfs property set -ts "${SNAPSHOT}" ro true
 btrfs send -f "${STREAM}" "${SNAPSHOT}"
 
 echo "[6/6] Compressing deployment archive..."
-tar -C "${OUTPUT_DIR}" -c -I 'xz -T0 -1' \
+tar -C "${OUTPUT_DIR}" -c -I 'xz -T0 -0' \
     -f "${ARCHIVE}" "$(basename "${STREAM}")"
 sha256sum "${ARCHIVE}" > "${OUTPUT_DIR}/sha256sum.txt"
 rm -f -- "${STREAM}"

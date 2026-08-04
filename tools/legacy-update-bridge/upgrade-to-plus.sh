@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-VERSION="1.0.2"
+VERSION="1.0.3"
 # A sudoers SHA-256 command digest can execute a script through /dev/fd/N.
 # In that case BASH_SOURCE no longer identifies the extracted update folder.
 # The legacy updater always extracts an asset into /tmp using the ZIP basename,

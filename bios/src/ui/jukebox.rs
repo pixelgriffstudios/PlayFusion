@@ -29,6 +29,8 @@ pub enum JukeboxVisualMode {
 enum JukeboxAction {
     Play { target: PathBuf, shuffle: bool },
     OpenAlbum { path: PathBuf, name: String },
+    ImportMusic,
+    DeleteIncludedMusic,
 }
 
 #[derive(Clone)]
@@ -63,6 +65,8 @@ pub struct JukeboxBrowserState {
     last_refresh: f64,
     cabinet_texture: Texture2D,
     visual_mode: JukeboxVisualMode,
+    confirm_delete_included: bool,
+    status_message: Option<(String, f64)>,
 }
 
 impl JukeboxBrowserState {
@@ -75,6 +79,8 @@ impl JukeboxBrowserState {
             last_refresh: -10.0,
             cabinet_texture: Texture2D::from_file_with_format(JUKEBOX_CABINET_BYTES, None),
             visual_mode: JukeboxVisualMode::Cabinet,
+            confirm_delete_included: false,
+            status_message: None,
         }
     }
 
@@ -136,6 +142,17 @@ impl JukeboxBrowserState {
             });
         }
 
+        self.items.push(JukeboxItem {
+            label: "IMPORT MUSIC FROM USB / SD".to_string(),
+            action: JukeboxAction::ImportMusic,
+        });
+        if Path::new(MUSIC_ROOT).join("30 years").is_dir() {
+            self.items.push(JukeboxItem {
+                label: "DELETE INCLUDED '30 YEARS' MUSIC".to_string(),
+                action: JukeboxAction::DeleteIncludedMusic,
+            });
+        }
+
         self.view = BrowserView::Library;
         self.selection = self.selection.min(self.items.len().saturating_sub(1));
         self.loaded = true;
@@ -191,6 +208,11 @@ impl JukeboxBrowserState {
             return JukeboxEvent::Select;
         }
         if input.back {
+            if self.confirm_delete_included {
+                self.confirm_delete_included = false;
+                self.status_message = Some(("DELETE CANCELLED".to_string(), get_time()));
+                return JukeboxEvent::Select;
+            }
             match self.view.clone() {
                 BrowserView::Library => return JukeboxEvent::BackToExtras,
                 BrowserView::Album { .. } => {
@@ -204,6 +226,7 @@ impl JukeboxBrowserState {
             return JukeboxEvent::None;
         }
         if input.up {
+            self.confirm_delete_included = false;
             self.selection = if self.selection == 0 {
                 self.items.len() - 1
             } else {
@@ -212,6 +235,7 @@ impl JukeboxBrowserState {
             return JukeboxEvent::Move;
         }
         if input.down {
+            self.confirm_delete_included = false;
             self.selection = (self.selection + 1) % self.items.len();
             return JukeboxEvent::Move;
         }
@@ -227,6 +251,41 @@ impl JukeboxBrowserState {
                         shuffle,
                         fullscreen: self.visual_mode == JukeboxVisualMode::Fullscreen,
                     };
+                }
+                JukeboxAction::ImportMusic => {
+                    let imported = import_music_from_removable_media();
+                    self.status_message = Some((
+                        if imported > 0 {
+                            format!("IMPORTED {imported} MUSIC FILE(S)")
+                        } else {
+                            "NO MUSIC FOUND IN A /MUSIC FOLDER".to_string()
+                        },
+                        get_time(),
+                    ));
+                    self.refresh();
+                    return JukeboxEvent::Select;
+                }
+                JukeboxAction::DeleteIncludedMusic => {
+                    if !self.confirm_delete_included {
+                        self.confirm_delete_included = true;
+                        self.status_message = Some((
+                            "PRESS [A] AGAIN TO DELETE INCLUDED MUSIC; [B] CANCELS".to_string(),
+                            get_time(),
+                        ));
+                    } else {
+                        self.confirm_delete_included = false;
+                        let target = Path::new(MUSIC_ROOT).join("30 years");
+                        self.status_message = Some((
+                            if fs::remove_dir_all(&target).is_ok() {
+                                "INCLUDED MUSIC DELETED".to_string()
+                            } else {
+                                "COULD NOT DELETE INCLUDED MUSIC".to_string()
+                            },
+                            get_time(),
+                        ));
+                        self.refresh();
+                    }
+                    return JukeboxEvent::Select;
                 }
             }
         }
@@ -381,7 +440,70 @@ impl JukeboxBrowserState {
             mode_size,
             Color::new(0.95, 0.95, 1.0, 1.0),
         );
+
+        if let Some((message, shown_at)) = self.status_message.as_ref() {
+            if self.confirm_delete_included || get_time() - *shown_at < 6.0 {
+                let status_size = (7.0 * scale_factor).max(7.0) as u16;
+                let status_dims = measure_text(message, Some(font), status_size, 1.0);
+                text_with_color(
+                    font_cache,
+                    config,
+                    message,
+                    (screen_width() - status_dims.width) * 0.5,
+                    301.0 * scale_factor,
+                    status_size,
+                    Color::new(1.0, 0.24, 0.78, 1.0),
+                );
+            }
+        }
     }
+}
+
+fn import_music_from_removable_media() -> usize {
+    let destination = Path::new(MUSIC_ROOT);
+    let mut imported = 0usize;
+    let roots = [Path::new("/run/media/gamer"), Path::new("/run/media"), Path::new("/media")];
+    for root in roots {
+        let Ok(mounts) = fs::read_dir(root) else {
+            continue;
+        };
+        for mount in mounts.flatten() {
+            let mount_path = mount.path();
+            if !mount_path.is_dir() {
+                continue;
+            }
+            for folder_name in ["Music", "music", "MUSIC"] {
+                let source = mount_path.join(folder_name);
+                if source.is_dir() {
+                    imported += copy_music_tree(&source, destination, &source);
+                }
+            }
+        }
+    }
+    imported
+}
+
+fn copy_music_tree(source: &Path, destination: &Path, source_root: &Path) -> usize {
+    let Ok(entries) = fs::read_dir(source) else {
+        return 0;
+    };
+    let mut copied = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            copied += copy_music_tree(&path, destination, source_root);
+        } else if is_music_file(&path) {
+            let relative = path.strip_prefix(source_root).unwrap_or_else(|_| Path::new("track"));
+            let target = destination.join(relative);
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            if !target.exists() && fs::copy(&path, &target).is_ok() {
+                copied += 1;
+            }
+        }
+    }
+    copied
 }
 
 fn is_music_file(path: &Path) -> bool {

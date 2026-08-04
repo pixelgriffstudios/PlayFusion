@@ -3,6 +3,7 @@ set -euo pipefail
 
 MUSIC_ROOT="${SUPER_KAZETA_MUSIC_ROOT:-/var/kazeta/music}"
 INPUT_CONFIG="/etc/super-kazeta/mpv-jukebox-input.conf"
+VISUALIZER_SCRIPT="/etc/super-kazeta/jukebox_visualizer.lua"
 PROJECTM_TEMPLATE="/etc/super-kazeta/projectm-config.inp"
 LOG_FILE="/var/kazeta/state/jukebox.log"
 PROJECTM_LOG="/var/kazeta/state/jukebox-projectm.log"
@@ -104,15 +105,15 @@ prepare_projectm() {
     fi
 
     local fullscreen=true window_width="$ROOT_WIDTH" window_height="$ROOT_HEIGHT"
-    if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
-        fullscreen=false
-        window_width="$JUKEBOX_WIDTH"
-        window_height="$JUKEBOX_HEIGHT"
-    fi
+    local texture_size=1024 mesh_x=128 mesh_y=72 visual_fps=60
 
     sed -i -E \
         -e "s|^Preset Path[[:space:]]*=.*|Preset Path = $FLAT_PRESET_ROOT|" \
         -e "s/^Preset Duration[[:space:]]*=.*/Preset Duration = $PRESET_SECONDS/" \
+        -e "s/^Texture Size[[:space:]]*=.*/Texture Size = $texture_size/" \
+        -e "s/^Mesh X[[:space:]]*=.*/Mesh X = $mesh_x/" \
+        -e "s/^Mesh Y[[:space:]]*=.*/Mesh Y = $mesh_y/" \
+        -e "s/^FPS[[:space:]]*=.*/FPS = $visual_fps/" \
         -e "s/^Fullscreen[[:space:]]*=.*/Fullscreen = $fullscreen/" \
         -e "s/^Window Width[[:space:]]*=.*/Window Width = $window_width/" \
         -e "s/^Window Height[[:space:]]*=.*/Window Height = $window_height/" \
@@ -179,10 +180,16 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$(dirname "$LOG_FILE")"
 
+MPV_DISPLAY_OPTIONS=(--no-video --force-window=no)
+if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
+    # Cabinet visuals are drawn natively by PlayFusion. Keeping MPV audio-only
+    # prevents X11/Wayland fullscreen state from leaking back from projectM.
+    MPV_DISPLAY_OPTIONS=(--no-video --force-window=no)
+fi
+
 /usr/bin/mpv \
     --no-config \
-    --no-video \
-    --force-window=no \
+    "${MPV_DISPLAY_OPTIONS[@]}" \
     --input-gamepad=yes \
     --input-conf="$INPUT_CONFIG" \
     "${ORDER_OPTIONS[@]}" \
@@ -194,24 +201,79 @@ MPV_PID=$!
 
 sleep 0.5
 
-# Both display modes listen to the monitor belonging to the active HDMI/DP
-# output. Cabinet mode publishes compact level data for PlayFusion's native
-# embedded visualizer; fullscreen mode keeps the full projectM preset library.
+if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
+    wait "$MPV_PID" || true
+    exit 0
+fi
+
+if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
+    export DISPLAY=${DISPLAY:-:0}
+    MPV_WINDOW=""
+    PLAYFUSION_WINDOW=""
+    if command -v xdotool >/dev/null 2>&1 &&
+        [[ -x /usr/local/bin/playfusion-xembed ]]; then
+        for _attempt in $(seq 1 80); do
+            MPV_WINDOW=$(
+                xdotool search --onlyvisible --pid "$MPV_PID" \
+                    --name '^PlayFusion Cabinet Visuals$' 2>/dev/null |
+                    head -n 1 || true
+            )
+            PLAYFUSION_WINDOW=$(
+                xdotool search --onlyvisible --name '^PlayFusion$' 2>/dev/null |
+                    head -n 1 || true
+            )
+            if [[ -n "$MPV_WINDOW" && -n "$PLAYFUSION_WINDOW" ]]; then
+                break
+            fi
+            sleep 0.1
+        done
+    fi
+
+    if [[ -n "$MPV_WINDOW" && -n "$PLAYFUSION_WINDOW" ]]; then
+        /usr/local/bin/playfusion-xembed \
+            "$MPV_WINDOW" "$PLAYFUSION_WINDOW" \
+            "$JUKEBOX_X" "$JUKEBOX_Y" "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT"
+        printf 'Embedded PlayFusion cabinet visualizer %s into %s at %sx%s+%s+%s\n' \
+            "$MPV_WINDOW" "$PLAYFUSION_WINDOW" \
+            "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT" "$JUKEBOX_X" "$JUKEBOX_Y" \
+            >>"$LOG_FILE"
+
+        if [[ -x "$BEZEL_BIN" && -s "$BEZEL_IMAGE" ]]; then
+            "$BEZEL_BIN" "$BEZEL_IMAGE" "$ROOT_WIDTH" "$ROOT_HEIGHT" \
+                "$JUKEBOX_X" "$JUKEBOX_Y" "$JUKEBOX_WIDTH" "$JUKEBOX_HEIGHT" \
+                >>"$PROJECTM_LOG" 2>&1 &
+            BEZEL_PID=$!
+            BEZEL_WINDOW=""
+            for _attempt in $(seq 1 50); do
+                BEZEL_WINDOW=$(
+                    xdotool search --onlyvisible --pid "$BEZEL_PID" \
+                        --name '^PlayFusion Jukebox Bezel$' 2>/dev/null |
+                        head -n 1 || true
+                )
+                [[ -n "$BEZEL_WINDOW" ]] && break
+                sleep 0.1
+            done
+            if [[ -n "$BEZEL_WINDOW" ]]; then
+                /usr/local/bin/playfusion-xembed \
+                    "$BEZEL_WINDOW" "$PLAYFUSION_WINDOW" \
+                    0 0 "$ROOT_WIDTH" "$ROOT_HEIGHT"
+            fi
+        fi
+    else
+        echo "Unable to attach PlayFusion cabinet visualizer window" >>"$LOG_FILE"
+    fi
+
+    wait "$MPV_PID" || true
+    exit 0
+fi
+
+# Fullscreen mode listens to the monitor belonging to the active HDMI/DP
+# output and retains the complete projectM preset library.
 DEFAULT_SINK=$(pactl get-default-sink 2>/dev/null || true)
 MONITOR_SOURCE="${DEFAULT_SINK:+${DEFAULT_SINK}.monitor}"
 if ! pactl list short sources 2>/dev/null |
     awk -v wanted="$MONITOR_SOURCE" '$2 == wanted { found=1 } END { exit !found }'; then
     MONITOR_SOURCE=""
-fi
-
-if [[ "$VISUAL_MODE" == "--cabinet" ]]; then
-    prepare_cabinet_geometry
-    prepare_projectm
-    rm -f "$OFFSCREEN_FRAME" "$OFFSCREEN_FRAME.tmp"
-    # Cabinet projectM now renders natively inside kazeta-bios. This launcher
-    # only owns audio playback so no external window or frame copy is needed.
-    wait "$MPV_PID" || true
-    exit 0
 fi
 
 if [[ -x "$PROJECTM_BIN" ]]; then

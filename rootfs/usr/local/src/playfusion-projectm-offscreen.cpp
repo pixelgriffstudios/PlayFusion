@@ -27,11 +27,13 @@
 #include <unistd.h>
 
 namespace {
-constexpr int kWidth = 1280;
-constexpr int kHeight = 720;
+// ProjectM is a constantly changing background, so motion matters more than
+// native pixel density. PlayFusion scales this 16:9 buffer to the TV while
+// keeping the menu itself at the display's full resolution.
+constexpr int kWidth = 640;
+constexpr int kHeight = 360;
 constexpr int kChannels = 2;
-constexpr int kFramesPerRead = 512;
-constexpr int kCornerRadius = 44;
+constexpr int kFramesPerRead = 256;
 constexpr std::size_t kHeaderSize = 24;
 
 struct SharedHeader {
@@ -42,15 +44,6 @@ struct SharedHeader {
     alignas(8) std::atomic<std::uint64_t> sequence;
 };
 static_assert(sizeof(SharedHeader) == kHeaderSize);
-
-bool inside_rounded_rect(int x, int y) {
-    const int radius = kCornerRadius;
-    const int nearest_x = std::clamp(x, radius, kWidth - radius - 1);
-    const int nearest_y = std::clamp(y, radius, kHeight - radius - 1);
-    const int dx = x - nearest_x;
-    const int dy = y - nearest_y;
-    return dx * dx + dy * dy <= radius * radius;
-}
 
 }  // namespace
 
@@ -183,10 +176,9 @@ int main(int argc, char** argv) {
         }
 
         visualizer.pcm()->addPCM16Data(audio.data(), kFramesPerRead);
-        // Two 512-frame monitor reads yield about 46.9 visual frames per
-        // second at 48 kHz. This is notably smoother in the cabinet while
-        // leaving headroom for the PlayFusion UI on Vega integrated graphics.
-        if (++audio_reads < 2) {
+        // Three 256-frame reads yield about 62 visual frames per second at
+        // 48 kHz, matching the responsiveness of fullscreen ProjectM.
+        if (++audio_reads < 3) {
             continue;
         }
         audio_reads = 0;
@@ -209,14 +201,6 @@ int main(int argc, char** argv) {
             pixels
         );
 
-        for (int y = 0; y < kHeight; ++y) {
-            for (int x = 0; x < kWidth; ++x) {
-                const std::size_t pixel =
-                    static_cast<std::size_t>((y * kWidth + x) * 4);
-                pixels[pixel + 3] =
-                    inside_rounded_rect(x, y) ? 255 : 0;
-            }
-        }
         header->sequence.store(next_sequence, std::memory_order_release);
     }
 

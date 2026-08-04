@@ -2,7 +2,7 @@
 set -euo pipefail
 
 UPLOAD_DIR="/var/kazeta/runtime-uploads"
-TARGET_DIR="/usr/share/kazeta/runtimes"
+TARGET_DIR="/var/kazeta/runtimes"
 
 mkdir -p "$UPLOAD_DIR" "$TARGET_DIR"
 shopt -s nullglob

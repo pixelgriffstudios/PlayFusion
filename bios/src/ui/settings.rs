@@ -385,7 +385,7 @@ pub fn get_settings_value(
         4 => match index {
             0 => {
                 // BGM SELECTION
-                // Always show the current track or "OFF"
+                // MP3 PLAYER shuffles the owner's music library on any theme.
                 let track = config.bgm_track.clone().unwrap_or("OFF".to_string());
                 trim_extension(&track).replace('_', " ").to_uppercase()
             }

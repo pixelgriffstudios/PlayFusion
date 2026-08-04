@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-NAME=kazeta-2025-0_545b900
-ARCHIVE="/var/tmp/playfusion-release-output/${NAME}.img.tar.xz"
-SEED=/var/tmp/playfusion-release-output/playfusion-seed
-IMAGE=/var/tmp/playfusion-release-verify.img
-MOUNT=/var/tmp/playfusion-release-verify
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+
+FLAVOR=${PLAYFUSION_FLAVOR:-full}
+case "$FLAVOR" in
+    full|lite) ;;
+    *) echo "PLAYFUSION_FLAVOR must be full or lite" >&2; exit 2 ;;
+esac
+
+NAME=playfusion-1.0-public
+ARCHIVE="/var/tmp/playfusion-release-output-${FLAVOR}/${NAME}.img.tar.xz"
+SEED="/var/tmp/playfusion-release-output-${FLAVOR}/playfusion-seed"
+IMAGE="/var/tmp/playfusion-release-verify-${FLAVOR}.img"
+MOUNT="/var/tmp/playfusion-release-verify-${FLAVOR}"
 LOOP=
 
 cleanup() {
@@ -19,8 +27,8 @@ trap cleanup EXIT
 test "$(id -u)" -eq 0
 test -f "$ARCHIVE"
 test -d "$SEED"
-test "$(realpath -m "$IMAGE")" = /var/tmp/playfusion-release-verify.img
-test "$(realpath -m "$MOUNT")" = /var/tmp/playfusion-release-verify
+test "$(realpath -m "$IMAGE")" = "/var/tmp/playfusion-release-verify-${FLAVOR}.img"
+test "$(realpath -m "$MOUNT")" = "/var/tmp/playfusion-release-verify-${FLAVOR}"
 
 # The receive pass below validates the complete XZ, tar, and Btrfs streams.
 # Avoid a separate list/test pass that would decompress this 8 GB archive twice.
@@ -35,9 +43,15 @@ tar -xf "$ARCHIVE" -O | btrfs receive "$MOUNT"
 
 DEPLOYMENT="$MOUNT/$NAME"
 test -d "$DEPLOYMENT"
-test "$(find "$DEPLOYMENT/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39
+if [[ "$FLAVOR" == full ]]; then
+    test "$(find "$DEPLOYMENT/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39
+    test -s "$DEPLOYMENT/usr/share/kazeta/runtimes/windows-1.2-experimental.kzr"
+else
+    test "$(find "$DEPLOYMENT/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 1
+    test -s "$DEPLOYMENT/usr/share/kazeta/runtimes/none.kzr"
+fi
 test "$(head -n 1 "$DEPLOYMENT/build_info")" = "$NAME"
-grep -qx 'VERSION=1.0.2' "$DEPLOYMENT/etc/playfusion-release"
+grep -qx 'VERSION=1.0.3' "$DEPLOYMENT/etc/playfusion-release"
 test -x "$DEPLOYMENT/usr/bin/playfusion-theme-splash"
 test -x "$DEPLOYMENT/usr/bin/playfusion-update-helper"
 test -x "$DEPLOYMENT/usr/bin/playfusion-update-health"
@@ -68,9 +82,9 @@ for theme in xbox_original xbox_2_0; do
 done
 grep -q '^resolution = "1280x720"$' "$SEED/user-data/kazeta-plus/config.toml"
 grep -q '^theme = "Default"$' "$SEED/user-data/kazeta-plus/config.toml"
-grep -q '^background_selection = "Retro Laser Grid"$' "$SEED/user-data/kazeta-plus/config.toml"
+grep -q '^background_selection = "ProjectM Fusion"$' "$SEED/user-data/kazeta-plus/config.toml"
 test -z "$(find "$SEED/movies" -mindepth 1 -print -quit)"
-test -n "$(find "$SEED/firmware" -type f -print -quit)"
+test -z "$(find "$SEED/firmware" -type f -print -quit)"
 test "$(cat "$SEED/active-profile")" = default
 test "$(find "$SEED/profiles" -maxdepth 1 -type f | wc -l)" -eq 1
 test "$(grep '^name = ' "$SEED/profiles/default.toml")" = 'name = "Default"'
@@ -79,6 +93,9 @@ test "$(find "$SEED/state" -mindepth 1 -maxdepth 1 | wc -l)" -eq 3
 test -d "$SEED/state/projectm-home"
 test -d "$SEED/state/wireplumber"
 test -f "$SEED/state/playfusion-favorites"
+
+"$SCRIPT_DIR/verify-public-rootfs.sh" "$DEPLOYMENT"
+"$SCRIPT_DIR/verify-public-rootfs.sh" "$SEED"
 
 echo ARCHIVE_VERIFY_OK
 du -sh "$ARCHIVE" "$DEPLOYMENT/usr/share/kazeta/runtimes" "$SEED"

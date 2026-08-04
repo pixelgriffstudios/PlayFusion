@@ -1,30 +1,18 @@
 # Current known issues
 
-These issues apply to the PlayFusion 1.0.1 public installer unless noted
-otherwise. Confirmed fixes will be recorded in `CHANGELOG.md` when released.
+These issues apply to the PlayFusion 1.0.3 release unless noted otherwise.
+Confirmed fixes are recorded in `CHANGELOG.md`.
 
 ## Experimental Android support
 
 The Waydroid runtime and Android controller tools are experimental and are not
-release-qualified in PlayFusion 1.0.2. No APKs are installed in the factory
+release-qualified in PlayFusion 1.0.3. No APKs are installed in the factory
 library. Some APKs can return to the PlayFusion menu, lack visible touch input,
 or fail on kernels and graphics drivers that do not satisfy Waydroid's
 requirements.
 
 Status: development is paused. Android support must not be treated as a stable
-feature when qualifying the 1.0.2 installer.
-
-## MP3 and Digital Jukebox playback
-
-On some hardware, attempting to play an MP3 directly or through the Digital
-Jukebox reports exit code 4. The player log confirms that MPV successfully
-opens the audio through PipeWire, then receives an explicit `quit 4` command
-immediately after the Xbox controller is detected. This points to the current
-MPV gamepad action mapping, not projectM, the codec, or a damaged audio file.
-Movie playback and game audio are not affected.
-
-Status: fixed in the in-development PlayFusion 1.0.2 source and verified on
-real hardware. The published PlayFusion 1.0.1 image is still affected.
+feature when qualifying the 1.0.3 installer.
 
 ## Artwork completion on larger removable-media libraries
 
@@ -34,7 +22,7 @@ appeared on the first insertion and the remainder appeared after the media was
 inserted a second time. Detection and playback still worked.
 
 Status: artwork queue completion and visible progress are targeted for
-PlayFusion 1.0.2.
+PlayFusion 1.0.4.
 
 ## Initial HDMI/DisplayPort audio selection
 
@@ -43,7 +31,8 @@ HDMI/DisplayPort display. Selecting the correct output in Settings and rebooting
 can make the selection persist, but profile creation and early reboot timing
 still need additional testing.
 
-Status: under investigation for PlayFusion 1.0.2.
+Status: remains hardware-dependent; the selected output is persisted once the
+PipeWire device is available during boot.
 
 ## Many internal expansion drives
 
@@ -52,7 +41,7 @@ eMMC devices, with each library mounted by filesystem UUID. The current Storage
 Manager draws only the rows that fit on screen. With five or six expansion
 drives, later entries can be recognized by the backend but hidden at 720p.
 
-Status: scrolling is planned for PlayFusion 1.0.2.
+Status: scrolling is planned for a later release.
 
 ## Virtual machines
 

@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+MUSIC_ROOT="${1:-/var/kazeta/music}"
+VOLUME="${2:-70}"
+PROJECTM_TEMPLATE=/etc/super-kazeta/projectm-config.inp
+PROJECTM_HOME=/var/kazeta/state/projectm-home
+PROJECTM_CONFIG="$PROJECTM_HOME/.projectM/config.inp"
+PRESET_ROOT=/usr/share/projectM/presets
+# The embedded home renderer shares its OpenGL context with Macroquad and
+# Gamescope. Keep it on the original, proven BLTC preset collection; several
+# presets in the later packs expose incomplete shader-loading frames in that
+# shared context. Fullscreen ProjectM uses its own configuration and still has
+# access to every installed collection.
+HOME_PRESET_ROOT="$PRESET_ROOT/presets_bltc201"
+FLAT_PRESETS="$PROJECTM_HOME/.local/share/playfusion/projectm-presets"
+MPV_PID=""
+IPC_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/playfusion-mp3-player.sock"
+
+cleanup() {
+    if [[ -n "$MPV_PID" ]]; then
+        kill -TERM "$MPV_PID" 2>/dev/null || true
+        wait "$MPV_PID" 2>/dev/null || true
+    fi
+    rm -f "$IPC_SOCKET"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$(dirname "$PROJECTM_CONFIG")" "$FLAT_PRESETS"
+if [[ ! -s "$PROJECTM_CONFIG" ]]; then
+    cp "$PROJECTM_TEMPLATE" "$PROJECTM_CONFIG"
+fi
+
+marker="$FLAT_PRESETS/.preset-count"
+source_count=$(find "$HOME_PRESET_ROOT" -type f \( -iname '*.milk' -o -iname '*.prjm' \) | wc -l)
+cached_count=$(cat "$marker" 2>/dev/null || printf 0)
+if [[ "$source_count" -gt 0 && "$cached_count" != "$source_count" ]]; then
+    find "$FLAT_PRESETS" -mindepth 1 -maxdepth 1 -type l -delete
+    index=0
+    # Start on a known lightweight visual so later presets can warm up behind
+    # a stable completed frame.
+    anchor="$HOME_PRESET_ROOT/Mstress & Juppy - Dancer.milk"
+    if [[ -f "$anchor" ]]; then
+        printf -v link_name '%05d-%s' "$index" "${anchor##*/}"
+        ln -s "$anchor" "$FLAT_PRESETS/$link_name"
+        index=$((index + 1))
+    fi
+    while IFS= read -r -d '' preset; do
+        # This preset renders incomplete startup passes with projectM 3.1.12
+        # on the Vega/Gamescope path. Exclude it from every generated list.
+        if [[ ${preset##*/} == "3dRaGoNs & Unchained - Dragon Science.milk" ]]; then
+            continue
+        fi
+        if [[ "$preset" == "$anchor" ]]; then
+            continue
+        fi
+        printf -v link_name '%05d-%s' "$index" "${preset##*/}"
+        ln -s "$preset" "$FLAT_PRESETS/$link_name"
+        index=$((index + 1))
+    done < <(find "$HOME_PRESET_ROOT" -type f \( -iname '*.milk' -o -iname '*.prjm' \) -print0 | sort -z)
+    printf '%s\n' "$source_count" >"$marker"
+fi
+
+sed -i -E \
+    -e "s|^Preset Path[[:space:]]*=.*|Preset Path = $FLAT_PRESETS|" \
+    -e 's/^Fullscreen[[:space:]]*=.*/Fullscreen = false/' \
+    -e 's/^Texture Size[[:space:]]*=.*/Texture Size = 1024/' \
+    -e 's/^Mesh X[[:space:]]*=.*/Mesh X = 128/' \
+    -e 's/^Mesh Y[[:space:]]*=.*/Mesh Y = 72/' \
+    -e 's/^FPS[[:space:]]*=.*/FPS = 60/' \
+    -e 's/^Preset Duration[[:space:]]*=.*/Preset Duration = 25/' \
+    -e 's/^Smooth Transition Duration[[:space:]]*=.*/Smooth Transition Duration = 4/' \
+    "$PROJECTM_CONFIG"
+
+mapfile -d '' USER_TRACKS < <(
+    find "$MUSIC_ROOT" -type f \
+        \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' \
+           -o -iname '*.opus' -o -iname '*.m4a' -o -iname '*.wav' \) \
+        ! -path "$MUSIC_ROOT/30 years/*" \
+        -print0 | sort -z
+)
+
+if [[ ${#USER_TRACKS[@]} -gt 0 ]]; then
+    TRACKS=("${USER_TRACKS[@]}")
+else
+    # PixelGriff's included album is the fallback soundtrack for a fresh
+    # install. As soon as the owner imports anything else, only their music is
+    # used by the ProjectM home theme.
+    mapfile -d '' TRACKS < <(
+        find "$MUSIC_ROOT" -type f \
+            \( -iname '*.mp3' -o -iname '*.flac' -o -iname '*.ogg' \
+               -o -iname '*.opus' -o -iname '*.m4a' -o -iname '*.wav' \) \
+            -print0 | sort -z
+    )
+fi
+
+if [[ ${#TRACKS[@]} -gt 0 ]]; then
+    rm -f "$IPC_SOCKET"
+    /usr/bin/mpv --no-config --no-video --force-window=no \
+        --input-terminal=no --input-ipc-server="$IPC_SOCKET" \
+        --shuffle --loop-playlist=inf --volume="$VOLUME" "${TRACKS[@]}" &
+    MPV_PID=$!
+    wait "$MPV_PID" || true
+else
+    while :; do sleep 30; done
+fi

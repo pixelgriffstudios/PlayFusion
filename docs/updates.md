@@ -1,8 +1,9 @@
 # Safe PlayFusion updates
 
-PlayFusion 1.0.2 is the baseline for internet updates. Open **Extras > Check
+PlayFusion 1.0.3 provides the protected native updater. Open **Extras > Check
 for Updates** to query only the official `pixelgriffstudios/PlayFusion` GitHub
-release channel.
+release channel. PlayFusion 1.0.0 through 1.0.2 use the signed legacy bridge
+published with 1.0.3 to install the same protected update package.
 
 Updates are cumulative by default. A console on 1.0.2 can install a later
 1.0.4, 2.0.0, or newer package directly when that package declares 1.0.2 as

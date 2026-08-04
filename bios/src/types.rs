@@ -157,6 +157,8 @@ pub struct BackgroundState {
     pub background_cover_paths: Vec<PathBuf>,
     pub last_background_cover_scan: f64,
     pub menu_maze: crate::ui::screensaver::MazeScreensaver,
+    pub projectm: crate::ui::projectm_background::ProjectMBackgroundState,
+    pub projectm_allowed: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-OS_NAME="PlayFusion 1.0.2"
+OS_NAME="PlayFusion 1.0.3"
 MIN_DISK_SIZE=28
 MOUNT_PATH=/tmp/frzr_root
 SEED_ARCHIVE=/root/playfusion-seed.tar
+FLAVOR=$(cat /root/playfusion-installer-flavor 2>/dev/null || printf full)
+case "$FLAVOR" in
+    full|lite) ;;
+    *) fail_install "The installer flavor marker is invalid." ;;
+esac
 
 enable_all_gamepads() {
     busctl set-property org.shadowblip.InputPlumber \
@@ -30,15 +35,55 @@ poll_gamepad() {
 }
 
 get_boot_disk() {
-    local source parent current_boot_id boot_disk_info part_uuid part part_path
+    local source parent archiso_label current_boot_id boot_disk_info part_uuid part part_path
+
+    boot_parent() {
+        local candidate=$1 candidate_type candidate_parent
+        test -n "${candidate}" || return 1
+        candidate=$(readlink -f -- "${candidate}" 2>/dev/null || printf '%s' "${candidate}")
+        candidate_type=$(lsblk -ndo TYPE "${candidate}" 2>/dev/null | xargs)
+        if test "${candidate_type}" = disk; then
+            basename "${candidate}"
+            return 0
+        fi
+        candidate_parent=$(lsblk -ndo PKNAME "${candidate}" 2>/dev/null | xargs)
+        test -n "${candidate_parent}" || return 1
+        printf '%s\n' "${candidate_parent}"
+    }
 
     source=$(findmnt -n -o SOURCE /run/archiso/bootmnt 2>/dev/null || true)
     if test -n "${source}"; then
-        parent=$(lsblk -ndo PKNAME "${source}" 2>/dev/null || true)
+        parent=$(boot_parent "${source}" 2>/dev/null || true)
         if test -n "${parent}"; then
             echo "${parent}"
             return
         fi
+    fi
+
+    # With copy-to-RAM installers, /run/archiso/bootmnt may be released before
+    # the UI starts. Resolve the ISO label from the kernel command line so the
+    # USB/SD installer can never be offered as an erase target.
+    archiso_label=$(sed -n \
+        's/.*[[:space:]]archisolabel=\([^[:space:]]*\).*/\1/p' \
+        /proc/cmdline 2>/dev/null | head -1)
+    if test -n "${archiso_label}"; then
+        source=$(blkid -L "${archiso_label}" 2>/dev/null || true)
+        if test -z "${source}" && test -e "/dev/disk/by-label/${archiso_label}"; then
+            source="/dev/disk/by-label/${archiso_label}"
+        fi
+        parent=$(boot_parent "${source}" 2>/dev/null || true)
+        if test -n "${parent}"; then
+            echo "${parent}"
+            return
+        fi
+    fi
+
+    # Last filesystem-based fallback for unusual firmware/USB combinations.
+    source=$(findmnt -rn -t iso9660 -o SOURCE 2>/dev/null | head -1 || true)
+    parent=$(boot_parent "${source}" 2>/dev/null || true)
+    if test -n "${parent}"; then
+        echo "${parent}"
+        return
     fi
 
     current_boot_id=$(efibootmgr 2>/dev/null | awk -F: '/BootCurrent/{gsub(/ /,"",$2); print $2; exit}')
@@ -96,6 +141,11 @@ select_disk() {
             name=$(awk '{print $1}' <<<"${line}")
             test -n "${name}" || continue
             test "${name}" != "${boot_disk}" || continue
+            # The installer requires a 32 GB target. Filtering undersized
+            # devices here also prevents a normal 8/16 GB installer stick from
+            # ever appearing in the chooser if firmware metadata is incomplete.
+            test "$(disk_bytes "${name}")" -ge \
+                $((MIN_DISK_SIZE * 1000 * 1000 * 1000)) || continue
             description=$(disk_description "${name}")
             choices+=("${name}" "${description}")
         done < <(lsblk -dn -o NAME,TYPE | awk '$2=="disk" && $1!~/^zram/{print}')
@@ -209,11 +259,20 @@ done < <(find "${MOUNT_PATH}/var/kazeta/internal-games" \
 
 test "$(find "${MOUNT_PATH}/var/kazeta/internal-games" -mindepth 2 -maxdepth 2 -type d | wc -l)" -eq 2 || \
     fail_install "The public game library failed validation."
-test "$(find "${DEPLOYMENT}/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39 || \
-    fail_install "The bundled runtime library failed validation."
+if [[ "$FLAVOR" == full ]]; then
+    test "$(find "${DEPLOYMENT}/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 39 || \
+        fail_install "The bundled runtime library failed validation."
+    test -s "${DEPLOYMENT}/usr/share/kazeta/runtimes/windows-1.2-experimental.kzr" || \
+        fail_install "The Windows 1.2 runtime is missing."
+else
+    test "$(find "${DEPLOYMENT}/usr/share/kazeta/runtimes" -maxdepth 1 -type f -name '*.kzr' | wc -l)" -eq 1 || \
+        fail_install "The lite runtime library failed validation."
+    test -s "${DEPLOYMENT}/usr/share/kazeta/runtimes/none.kzr" || \
+        fail_install "The lite runtime sentinel is missing."
+fi
 test "$(find "${MOUNT_PATH}/var/kazeta/user-data/kazeta-plus/themes" -mindepth 1 -maxdepth 1 -type d | wc -l)" -eq 2 || \
     fail_install "The factory theme library failed validation."
-grep -qx 'VERSION=1.0.2' "${DEPLOYMENT}/etc/playfusion-release" || \
+grep -qx 'VERSION=1.0.3' "${DEPLOYMENT}/etc/playfusion-release" || \
     fail_install "The installed PlayFusion version is incorrect."
 test -x "${DEPLOYMENT}/usr/bin/playfusion-update-helper" || \
     fail_install "The signed update helper is missing."
@@ -225,10 +284,16 @@ test "$(stat -c '%u:%g' "${MOUNT_PATH}/var/kazeta/saves/default")" = 1000:1000 |
 printf '%s\n' 'playfusion/local' > "${MOUNT_PATH}/source"
 sync
 
-MESSAGE="PlayFusion 1.0.2 installed successfully.
+if [[ "$FLAVOR" == full ]]; then
+    RUNTIME_MESSAGE="All 39 system runtimes"
+else
+    RUNTIME_MESSAGE="Runtime Manager (download runtimes after installation)"
+fi
+
+MESSAGE="PlayFusion 1.0.3 ${FLAVOR} installed successfully.
 
 Included:
-  - All 39 system runtimes
+  - ${RUNTIME_MESSAGE}
   - Hell on Rails
   - PlayFusion Arcade
   - 30 years music album

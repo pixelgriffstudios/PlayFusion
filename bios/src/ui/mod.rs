@@ -27,6 +27,7 @@ pub mod main_menu;
 pub mod media_library;
 pub mod media_player;
 pub mod power;
+pub mod projectm_background;
 pub mod profiles;
 pub mod runtime_downloader;
 pub mod screensaver;
@@ -174,6 +175,12 @@ pub fn render_background(
     config: &Config,
     state: &mut BackgroundState,
 ) {
+    if config.background_selection == "ProjectM Fusion" {
+        state.projectm.draw(state.projectm_allowed);
+        return;
+    }
+    state.projectm.stop_visuals();
+
     if backgrounds::is_procedural_background(&config.background_selection) {
         backgrounds::draw(&config.background_selection, state);
         return;
@@ -1270,6 +1277,38 @@ pub fn draw_playfusion_panel_frame(
     draw_line(x + width, y, x + width, y + height, thickness, right);
     draw_line(x + width, y + height, x, y + height, thickness, bottom);
     draw_line(x, y + height, x, y, thickness, left);
+}
+
+/// Draws a subdued panel border that follows the active theme. Unlike the
+/// selection cursor this does not pulse or resize, so grids remain readable
+/// while still adopting a theme's accent color.
+pub fn draw_themed_panel_frame(
+    config: &Config,
+    animation_state: &AnimationState,
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+    thickness: f32,
+    intensity: f32,
+) {
+    let alpha = intensity.clamp(0.0, 1.0);
+    match config.cursor_color.as_str() {
+        "PLAYFUSION" => {
+            draw_playfusion_neon_frame(x, y, width, height, thickness, alpha);
+        }
+        "RAINBOW FUSION" => {
+            draw_rainbow_fusion_frame(x, y, width, height, thickness, alpha);
+        }
+        _ => {
+            let mut color = animation_state.get_cursor_color(config);
+            color.a = alpha;
+            let mut glow = color;
+            glow.a = alpha * 0.16;
+            draw_rectangle_lines(x, y, width, height, thickness * 2.6, glow);
+            draw_rectangle_lines(x, y, width, height, thickness, color);
+        }
+    }
 }
 
 // text when "PLAY" or "COPY SESSION LOGS" is greyed out

@@ -1169,6 +1169,8 @@ async fn main() {
         background_cover_paths: Vec::new(),
         last_background_cover_scan: -100.0,
         menu_maze: ui::screensaver::MazeScreensaver::new(),
+        projectm: ui::projectm_background::ProjectMBackgroundState::new(),
+        projectm_allowed: true,
     };
 
     // Keep PlayFusion's procedural collection first, then expose installed
@@ -1205,7 +1207,7 @@ async fn main() {
     font_choices.sort();
 
     // bgm
-    let mut bgm_choices: Vec<String> = vec!["OFF".to_string()];
+    let mut bgm_choices: Vec<String> = vec!["OFF".to_string(), "MP3 PLAYER".to_string()];
     let track_names: Vec<String> = music_files
         .iter()
         .filter_map(|path| path.file_name())
@@ -1465,6 +1467,29 @@ async fn main() {
         input_state.reset();
         input_state.update_keyboard();
         input_state.update_controller(&mut gilrs);
+
+        // ProjectM Fusion is a live menu background, not a game/media overlay.
+        // Stop both its renderer and shuffled music before any dedicated
+        // player, game session, or screensaver takes ownership of the screen.
+        background_state.projectm_allowed = game_process.is_none()
+            && music_screensaver_process.is_none()
+            && !menu_screensaver_active
+            && !matches!(
+                current_screen,
+                Screen::CdPlayer
+                    | Screen::DvdPlayer
+                    | Screen::MoviePlayer
+                    | Screen::MusicPlayer
+                    | Screen::JukeboxPlayer
+            );
+        if !background_state.projectm_allowed {
+            background_state.projectm.stop_visuals();
+        }
+        let mp3_player_enabled = background_state.projectm_allowed
+            && config.bgm_track.as_deref() == Some("MP3 PLAYER");
+        background_state
+            .projectm
+            .set_audio_enabled(mp3_player_enabled, config.bgm_volume);
 
         // The 3D maze is a BIOS-menu screensaver only. Games run after this
         // process exits, so the saver cannot activate over gameplay.
@@ -1731,6 +1756,14 @@ async fn main() {
                 if get_time() >= next_ftp_refresh {
                     ftp_endpoint = ui::internal_games::ftp_endpoint();
                     next_ftp_refresh = get_time() + 5.0;
+                }
+
+                if mp3_player_enabled && (input_state.next || input_state.prev) {
+                    let now_playing = background_state
+                        .projectm
+                        .cycle_track(input_state.next)
+                        .unwrap_or_else(|| "CHANGING TRACK...".to_string());
+                    flash_message = Some((format!("NOW PLAYING: {now_playing}"), 3.0));
                 }
 
                 ui::main_menu::update(
@@ -2488,6 +2521,18 @@ async fn main() {
                 )
                 .await;
 
+                // A theme can select its own BGM, or clear BGM when returning
+                // to the built-in default theme. Asset reloading alone does not
+                // replace the currently playing Rodio sink, so explicitly
+                // synchronize playback with the newly applied configuration.
+                let selected_bgm = config.bgm_track.as_deref().unwrap_or("OFF");
+                play_new_bgm(
+                    selected_bgm,
+                    config.bgm_volume,
+                    &music_cache,
+                    &mut current_bgm,
+                );
+
                 // 4. After reloading, go back to the downloader screen
                 current_screen = Screen::ThemeDownloader;
             }
@@ -2550,7 +2595,7 @@ async fn main() {
                 );
             }
             Screen::Power => {
-                ui::power::update(
+                let power_event = ui::power::update(
                     &mut current_screen,
                     &mut power_menu_selection,
                     &input_state,
@@ -2558,6 +2603,11 @@ async fn main() {
                     &sound_effects,
                     &config,
                 );
+
+                if power_event == ui::power::PowerEvent::RestartPlayFusion {
+                    (current_screen, fade_start_time) =
+                        trigger_session_restart(&mut current_bgm, &music_cache);
+                }
 
                 ui::power::draw(
                     power_menu_selection,

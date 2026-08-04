@@ -25,6 +25,7 @@ pub const EXTRAS_MENU_OPTIONS: &[&str] = &[
     "ANDROID CONTROLLER SUPPORT",
     "USER PROFILES",
     "THEME MANAGEMENT",
+    "RUNTIME MANAGEMENT",
     "CHECK FOR UPDATES",
     "PC CONTROLLER PROFILES",
 ];
@@ -72,8 +73,9 @@ pub fn update(
             10 => *current_screen = Screen::AndroidControllerSetup,
             11 => *current_screen = Screen::Profiles,
             12 => *current_screen = Screen::ThemeDownloader,
-            13 => *current_screen = Screen::UpdateChecker,
-            14 => {
+            13 => *current_screen = Screen::RuntimeDownloader,
+            14 => *current_screen = Screen::UpdateChecker,
+            15 => {
                 let _ = Command::new("/usr/bin/playfusion-pc-controller-profiles").status();
             }
             _ => {}

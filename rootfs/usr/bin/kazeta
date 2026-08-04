@@ -206,9 +206,11 @@ function find_runtime {
 
 # --- Define runtime paths ---
 SYSTEM_RUNTIME_DIR="/usr/share/kazeta/runtimes"
+USER_RUNTIME_DIR="/var/kazeta/runtimes"
 MOUNTED_GAME_DIR="${cart_path}" # inside the .kzp or folder
 PHYSICAL_MEDIA_DIR="${media_path}" # the SD card or folder containing the .kzp
-DEFAULT_RUNTIME="${SYSTEM_RUNTIME_DIR}/none.kzr"
+DEFAULT_RUNTIME="${USER_RUNTIME_DIR}/none.kzr"
+[ -f "$DEFAULT_RUNTIME" ] || DEFAULT_RUNTIME="${SYSTEM_RUNTIME_DIR}/none.kzr"
 
 runtime_name="$(get_attribute 'Runtime' ${cart_info})"
 runtime="" # Initialize as empty
@@ -216,9 +218,13 @@ runtime="" # Initialize as empty
 if [ -n "$runtime_name" ]; then
 	echo "DEBUG: Runtime requested: '$runtime_name'"
 
-	# --- 1. Check Internal Drive (/usr/share/kazeta/runtimes) (priority 1) ---
-	echo "DEBUG: Checking for runtime on internal drive..."
-	runtime=$(find_runtime "$runtime_name" "$SYSTEM_RUNTIME_DIR")
+	# --- 1. Check downloaded runtimes, then built-in runtimes ---
+	echo "DEBUG: Checking downloaded runtimes..."
+	runtime=$(find_runtime "$runtime_name" "$USER_RUNTIME_DIR")
+	if [ -z "$runtime" ]; then
+		echo "DEBUG: Checking built-in runtimes..."
+		runtime=$(find_runtime "$runtime_name" "$SYSTEM_RUNTIME_DIR")
+	fi
 
 	# --- 2. Check physical media (/run/media/<name-of-removable-media-label>) (fallback) ---
 	if [ -z "$runtime" ] && [ -n "$PHYSICAL_MEDIA_DIR" ]; then # -z checks if the string is empty (not found)
@@ -263,11 +269,14 @@ sudo /usr/bin/playfusion-controller-setup \
 runtimedir="${BASE_DIR}/run/runtime"
 sudo kazeta-mount "${lower}" "${upper}" "${work}" "${target}" "${runtime}" "${runtimedir}"
 
+EXIT_HOTKEY_PID=""
+
 # --- TRAP SETUP (Clean up on exit) ---
 trap "\
 	if [ -n \"\$PLAYTIME_PID\" ]; then kill \"\$PLAYTIME_PID\" 2>/dev/null; fi; \
 	if [ -n \"\$ANTIMICROX_PID\" ]; then kill \"\$ANTIMICROX_PID\" 2>/dev/null; fi; \
 	if [ -n \"\$ANDROID_TOUCH_PID\" ]; then kill \"\$ANDROID_TOUCH_PID\" 2>/dev/null; fi; \
+	if [ -n \"\$EXIT_HOTKEY_PID\" ]; then kill \"\$EXIT_HOTKEY_PID\" 2>/dev/null; fi; \
 	if [ -n \"\$ANTIMICROX_PID\" ]; then /usr/bin/playfusion-osk-toggle --stop 2>/dev/null || true; fi; \
 	popd; \
 	sudo kazeta-mount --unmount "${target}" "${runtimedir}"; \
@@ -419,6 +428,22 @@ rm -f .kazeta/var/playtime_end
 mkdir -p .kazeta/var
 date --iso-8601=seconds > .kazeta/var/playtime_start
 PLAYTIME_PID=""
+
+# Xbox One View (double-square) + Menu (three-lines), held together for one
+# second, emits a real Escape key. The virtual keyboard is created before
+# Gamescope starts so every emulator and native runtime can see it.
+if [[ -x /usr/bin/playfusion-game-exit-hotkey ]]; then
+	hotkey_options=()
+	if find "${HOME}" -maxdepth 6 -type f -name retroarch.cfg -print -quit 2>/dev/null | grep -q .; then
+		/usr/bin/kazeta-apply-retroarch-menu-hotkey "${HOME}" ||
+			echo "WARNING: Unable to configure the RetroArch menu hotkey."
+		hotkey_options+=(--retroarch-menu)
+	fi
+	/usr/bin/playfusion-game-exit-hotkey "${hotkey_options[@]}" \
+		> "${HOME}/.kazeta/var/game-exit-hotkey.log" 2>&1 9>&- &
+	EXIT_HOTKEY_PID=$!
+	sleep 0.3
+fi
 
 # --- EXECUTION & ERROR HANDLING ---
 

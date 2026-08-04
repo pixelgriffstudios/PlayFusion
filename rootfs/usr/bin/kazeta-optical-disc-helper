@@ -5,7 +5,8 @@ STATE_DIR=/run/kazeta/optical
 VISIBLE_CART=/run/media/kazeta-optical
 CACHE_ROOT=/var/kazeta/optical-cache
 FIRMWARE_ROOT=/var/kazeta/firmware
-RUNTIME_ROOT=/usr/share/kazeta/runtimes
+USER_RUNTIME_ROOT=/var/kazeta/runtimes
+SYSTEM_RUNTIME_ROOT=/usr/share/kazeta/runtimes
 ICON_ROOT=/usr/share/kazeta/optical-icons
 UNKNOWN_ICON="$ICON_ROOT/unknown.png"
 CATALOG_ROOT=/usr/share/playfusion/databases
@@ -34,16 +35,18 @@ remove_virtual_cart() {
 
 find_runtime() {
     local name=$1
-    local candidate
+    local root candidate
 
-    for candidate in \
-        "$RUNTIME_ROOT/$name" \
-        "$RUNTIME_ROOT/$name.kzr" \
-        "$RUNTIME_ROOT/$name-"*.kzr; do
-        if [ -f "$candidate" ]; then
-            printf '%s\n' "$candidate"
-            return 0
-        fi
+    for root in "$USER_RUNTIME_ROOT" "$SYSTEM_RUNTIME_ROOT"; do
+        for candidate in \
+            "$root/$name" \
+            "$root/$name.kzr" \
+            "$root/$name-"*.kzr; do
+            if [ -f "$candidate" ]; then
+                printf '%s\n' "$candidate"
+                return 0
+            fi
+        done
     done
     return 1
 }

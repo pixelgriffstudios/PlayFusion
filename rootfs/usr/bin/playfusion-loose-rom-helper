@@ -4,7 +4,8 @@ set -Eeuo pipefail
 VISIBLE_CART=/run/media/playfusion-loose-rom
 CACHE_ROOT=/var/kazeta/loose-rom-cache
 STATE_DIR=/run/kazeta/loose-rom
-RUNTIME_ROOT=/usr/share/kazeta/runtimes
+USER_RUNTIME_ROOT=/var/kazeta/runtimes
+SYSTEM_RUNTIME_ROOT=/usr/share/kazeta/runtimes
 ICON_ROOT=/usr/share/kazeta/optical-icons
 UNKNOWN_ICON="$ICON_ROOT/unknown.png"
 COVER_ROOT=https://raw.githubusercontent.com/libretro-thumbnails
@@ -51,11 +52,14 @@ runtime_exists() {
     # Native Linux payloads (movies and music) launch host-side players and
     # therefore do not require a packaged Kazeta runtime.
     [ "$runtime" != linux ] || return 0
-    for candidate in \
-        "$RUNTIME_ROOT/$runtime" \
-        "$RUNTIME_ROOT/$runtime.kzr" \
-        "$RUNTIME_ROOT/$runtime-"*.kzr; do
-        [ -f "$candidate" ] && return 0
+    local root
+    for root in "$USER_RUNTIME_ROOT" "$SYSTEM_RUNTIME_ROOT"; do
+        for candidate in \
+            "$root/$runtime" \
+            "$root/$runtime.kzr" \
+            "$root/$runtime-"*.kzr; do
+            [ -f "$candidate" ] && return 0
+        done
     done
     return 1
 }

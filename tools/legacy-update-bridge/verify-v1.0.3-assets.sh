@@ -97,6 +97,12 @@ for protected in \
 done
 test -f "$work/post-install"
 bash -n "$work/post-install"
+PLAYFUSION_THEME_TEST_ONLY=1 \
+PLAYFUSION_THEME_TEST_ROOT="$work/theme-install-test" \
+PLAYFUSION_THEME_TEST_ARCHIVE_ROOT="$work/root/usr/share/playfusion/themes" \
+    bash "$work/post-install"
+test -s "$work/theme-install-test/xbox_original/theme.toml"
+test -s "$work/theme-install-test/xbox_2_0/theme.toml"
 
 unzip -q "$LEGACY" -d "$work/legacy"
 kit="$work/legacy/PlayFusion-legacy-update-v${VERSION}"

@@ -6,13 +6,17 @@ PERSISTENT_DATA=/var/kazeta/user-data/kazeta-plus
 THEME_ROOT="$PERSISTENT_DATA/themes"
 
 install_theme_archive() {
-    local archive=$1 folder=$2 stage entry
+    local archive=$1 folder=$2 stage entry normalized
     test -s "$archive"
     stage=$(mktemp -d "/var/tmp/playfusion-theme-${folder}.XXXXXX")
     while IFS= read -r entry; do
-        entry=${entry#./}
-        case "$entry" in "$folder"|"$folder/"|"$folder/"*) ;; *) rm -rf -- "$stage"; return 1 ;; esac
-        case "/$entry/" in *'/../'*|*'//'*) rm -rf -- "$stage"; return 1 ;; esac
+        normalized=${entry#./}
+        # Archive directory records conventionally end in '/'. Strip that
+        # marker before validating so a legitimate "theme/" entry is not
+        # mistaken for an embedded double slash.
+        normalized=${normalized%/}
+        case "$normalized" in "$folder"|"$folder/"*) ;; *) rm -rf -- "$stage"; return 1 ;; esac
+        case "/$normalized/" in *'/../'*|*'//'*) rm -rf -- "$stage"; return 1 ;; esac
     done < <(bsdtar -tf "$archive")
     bsdtar --no-same-owner -xf "$archive" -C "$stage"
     test -s "$stage/$folder/theme.toml"
@@ -21,6 +25,17 @@ install_theme_archive() {
     chown -R gamer:gamer "$THEME_ROOT/$folder"
     rm -rf -- "$stage"
 }
+
+# Packaging verification exercises the real archive installer against a
+# disposable destination. This catches archive-layout regressions before an
+# update is signed without touching a console's persistent data.
+if test "${PLAYFUSION_THEME_TEST_ONLY:-0}" = 1; then
+    THEME_ROOT=${PLAYFUSION_THEME_TEST_ROOT:?Missing theme test destination}
+    test_archives=${PLAYFUSION_THEME_TEST_ARCHIVE_ROOT:?Missing theme test archives}
+    install_theme_archive "$test_archives/xbox_original-PlayFusion-optimized.zip" xbox_original
+    install_theme_archive "$test_archives/xbox_2_0-PlayFusion.zip" xbox_2_0
+    exit 0
+fi
 
 install -d -o gamer -g gamer -m 0755 /var/kazeta/user-data /var/kazeta/state
 install -d -o gamer -g gamer -m 0755 /var/kazeta/state/projectm-home \

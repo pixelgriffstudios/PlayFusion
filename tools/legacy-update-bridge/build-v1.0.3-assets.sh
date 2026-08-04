@@ -32,6 +32,7 @@ find "$PAYLOAD" -type f -name '*.kzr' -delete
 rm -f -- \
     "$PAYLOAD/usr/bin/playfusion-update-helper" \
     "$PAYLOAD/usr/bin/playfusion-update-health" \
+    "$PAYLOAD/usr/bin/playfusion-game-exit-hotkey" \
     "$PAYLOAD/etc/playfusion-update-public.pem" \
     "$PAYLOAD/etc/systemd/system/playfusion-update-health.service"
 printf 'PRODUCT=PlayFusion\nVERSION=1.0.3\n' > "$PAYLOAD/etc/playfusion-release"
@@ -55,6 +56,7 @@ for executable in upgrade-to-plus.sh; do
 done
 install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-update-helper" "$KIT/playfusion-update-helper"
 install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-update-health" "$KIT/playfusion-update-health"
+install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-game-exit-hotkey" "$KIT/playfusion-game-exit-hotkey"
 install -m 0644 "$SOURCE/rootfs/etc/systemd/system/playfusion-update-health.service" "$KIT/playfusion-update-health.service"
 install -m 0440 "$SOURCE/rootfs/etc/sudoers.d/playfusion-update" "$KIT/playfusion-update.sudoers"
 install -m 0644 "$SOURCE/rootfs/etc/playfusion-update-public.pem" "$KIT/playfusion-update-public.pem"

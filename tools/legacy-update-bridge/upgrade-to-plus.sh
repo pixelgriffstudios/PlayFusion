@@ -31,6 +31,7 @@ restore_bootstrap() {
     for relative in \
         usr/bin/playfusion-update-helper \
         usr/bin/playfusion-update-health \
+        usr/bin/playfusion-game-exit-hotkey \
         etc/playfusion-update-public.pem \
         etc/playfusion-release \
         etc/systemd/system/playfusion-update-health.service \
@@ -69,6 +70,7 @@ mkdir -p "$BACKUP/root"
 for relative in \
     usr/bin/playfusion-update-helper \
     usr/bin/playfusion-update-health \
+    usr/bin/playfusion-game-exit-hotkey \
     etc/playfusion-update-public.pem \
     etc/playfusion-release \
     etc/systemd/system/playfusion-update-health.service \
@@ -85,6 +87,9 @@ BOOTSTRAP_ACTIVE=1
 
 install -o root -g root -m 0755 "${KIT_DIR}/playfusion-update-helper" /usr/bin/playfusion-update-helper
 install -o root -g root -m 0755 "${KIT_DIR}/playfusion-update-health" /usr/bin/playfusion-update-health
+hotkey_temp=$(mktemp /usr/bin/.playfusion-game-exit-hotkey.update.XXXXXX)
+install -o root -g root -m 0755 "${KIT_DIR}/playfusion-game-exit-hotkey" "$hotkey_temp"
+mv -Tf -- "$hotkey_temp" /usr/bin/playfusion-game-exit-hotkey
 install -o root -g root -m 0644 "$PUBLIC_KEY" /etc/playfusion-update-public.pem
 install -o root -g root -m 0644 "${KIT_DIR}/playfusion-update-health.service" \
     /etc/systemd/system/playfusion-update-health.service

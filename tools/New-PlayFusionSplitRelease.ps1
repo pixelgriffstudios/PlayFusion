@@ -30,6 +30,10 @@ $baseName = if ($Edition -eq 'Public') {
 } else {
     "PlayFusion-$Version-$Edition-Installer.img"
 }
+$artifactSuffix = if ($Edition -eq 'Public') { '' } else { "-$Edition" }
+$checksumName = "SHA256SUMS$artifactSuffix.txt"
+$readmeName = "README-FIRST$artifactSuffix.txt"
+$rebuildStem = "Rebuild-PlayFusion$artifactSuffix-Installer"
 
 # Clean only this version's generated artifacts inside the explicitly named
 # release directory. Other releases and arbitrary user files are untouched.
@@ -37,10 +41,10 @@ Get-ChildItem -LiteralPath $output -File -ErrorAction SilentlyContinue |
     Where-Object {
         $_.Name -like "$baseName.part*" -or
         $_.Name -in @(
-            'README-FIRST.txt', 'SHA256SUMS.txt',
-            'Rebuild-PlayFusion-Installer.ps1',
-            'Rebuild-PlayFusion-Installer.cmd',
-            'Rebuild-PlayFusion-Installer-Linux.sh'
+            $readmeName, $checksumName,
+            "$rebuildStem.ps1",
+            "$rebuildStem.cmd",
+            "$rebuildStem-Linux.sh"
         )
     } | Remove-Item -Force
 
@@ -82,7 +86,7 @@ $checksumLines = foreach ($part in $parts) {
 }
 $checksumLines += "$imageHash  $baseName"
 [System.IO.File]::WriteAllLines(
-    (Join-Path $output 'SHA256SUMS.txt'),
+    (Join-Path $output $checksumName),
     $checksumLines,
     [System.Text.UTF8Encoding]::new($false)
 )
@@ -90,7 +94,7 @@ $checksumLines += "$imageHash  $baseName"
 $rebuildPs1 = @'
 $ErrorActionPreference = 'Stop'
 $folder = Split-Path -Parent $MyInvocation.MyCommand.Path
-$parts = Get-ChildItem -LiteralPath $folder -Filter 'PlayFusion-*-Installer.img.part*' |
+$parts = Get-ChildItem -LiteralPath $folder -Filter '__BASE_NAME__.part*' |
     Sort-Object Name
 if (-not $parts) { throw 'No numbered installer parts were found.' }
 $outputName = $parts[0].Name -replace '\.part\d+$', ''
@@ -103,7 +107,7 @@ try {
     }
 }
 finally { $stream.Dispose() }
-$expectedLine = Get-Content -LiteralPath (Join-Path $folder 'SHA256SUMS.txt') |
+$expectedLine = Get-Content -LiteralPath (Join-Path $folder '__CHECKSUM_NAME__') |
     Where-Object { $_ -match [regex]::Escape($outputName) + '$' } |
     Select-Object -First 1
 if (-not $expectedLine) { throw 'The complete-image checksum is missing.' }
@@ -112,19 +116,21 @@ $actual = (Get-FileHash -Algorithm SHA256 -LiteralPath $outputPath).Hash
 if ($actual -ine $expected) { throw "Rebuilt image checksum failed: $actual" }
 Write-Host "Rebuilt and verified: $outputPath"
 '@
+$rebuildPs1 = $rebuildPs1.Replace('__BASE_NAME__', $baseName)
+$rebuildPs1 = $rebuildPs1.Replace('__CHECKSUM_NAME__', $checksumName)
 [System.IO.File]::WriteAllText(
-    (Join-Path $output 'Rebuild-PlayFusion-Installer.ps1'),
+    (Join-Path $output "$rebuildStem.ps1"),
     $rebuildPs1,
     [System.Text.UTF8Encoding]::new($false)
 )
 
-$rebuildCmd = @'
+$rebuildCmd = @"
 @echo off
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0Rebuild-PlayFusion-Installer.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0$rebuildStem.ps1"
 pause
-'@
+"@
 [System.IO.File]::WriteAllText(
-    (Join-Path $output 'Rebuild-PlayFusion-Installer.cmd'),
+    (Join-Path $output "$rebuildStem.cmd"),
     $rebuildCmd,
     [System.Text.ASCIIEncoding]::new()
 )
@@ -133,18 +139,20 @@ $rebuildLinux = @'
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
-base=$(find . -maxdepth 1 -type f -name 'PlayFusion-*-Installer.img.part001' -printf '%f\n' | head -n1)
+base=$(find . -maxdepth 1 -type f -name '__BASE_NAME__.part001' -printf '%f\n' | head -n1)
 test -n "$base"
 output=${base%.part001}
-grep '\.part[0-9][0-9][0-9]$' SHA256SUMS.txt | sha256sum -c -
+grep '\.part[0-9][0-9][0-9]$' __CHECKSUM_NAME__ | sha256sum -c -
 cat -- "$output".part[0-9][0-9][0-9] > "$output"
 expected=$(awk -v file="$output" '$2 == file { print $1 }' SHA256SUMS.txt)
 actual=$(sha256sum "$output" | awk '{ print $1 }')
 test -n "$expected" && test "$actual" = "$expected"
 printf 'Rebuilt and verified: %s\n' "$output"
 '@
+$rebuildLinux = $rebuildLinux.Replace('__BASE_NAME__', $baseName)
+$rebuildLinux = $rebuildLinux.Replace('__CHECKSUM_NAME__', $checksumName)
 [System.IO.File]::WriteAllText(
-    (Join-Path $output 'Rebuild-PlayFusion-Installer-Linux.sh'),
+    (Join-Path $output "$rebuildStem-Linux.sh"),
     $rebuildLinux,
     [System.Text.UTF8Encoding]::new($false)
 )
@@ -170,7 +178,7 @@ Part size: $PartSizeBytes bytes (below GitHub's 2 GiB asset limit)
 Complete image SHA-256: $imageHash
 "@
 [System.IO.File]::WriteAllText(
-    (Join-Path $output 'README-FIRST.txt'),
+    (Join-Path $output $readmeName),
     $readme,
     [System.Text.UTF8Encoding]::new($false)
 )

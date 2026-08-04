@@ -87,6 +87,7 @@ test ! -e "$work/root/var/kazeta"
 for protected in \
     usr/bin/playfusion-update-helper \
     usr/bin/playfusion-update-health \
+    usr/bin/playfusion-game-exit-hotkey \
     etc/playfusion-update-public.pem \
     etc/systemd/system/playfusion-update-health.service; do
     test ! -e "$work/root/$protected" || {
@@ -104,6 +105,7 @@ for name in \
     "PlayFusion-update-v${VERSION}.pfu.sha256" \
     "PlayFusion-update-v${VERSION}.pfu.sig" \
     playfusion-update-helper playfusion-update-health \
+    playfusion-game-exit-hotkey \
     playfusion-update-health.service playfusion-update-public.pem \
     playfusion-update.sudoers upgrade-to-plus.sh; do
     test -s "$kit/$name" || { printf 'Missing legacy member: %s\n' "$name" >&2; exit 1; }

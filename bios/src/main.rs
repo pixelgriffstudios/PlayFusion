@@ -75,7 +75,7 @@ pub const DEV_MODE: bool = false;
 
 macro_rules! ver {
     () => {
-        "1.0.2"
+        "1.0.3"
     };
 } // Define the version number here
 #[cfg(feature = "dev")]

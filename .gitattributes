@@ -1,0 +1,23 @@
+# PlayFusion is a Linux operating-system project.  Keep every text file in the
+# repository LF-terminated even when the release is prepared from Windows.
+* text=auto eol=lf
+
+# Never reinterpret packaged or generated binary assets as text.
+*.7z binary
+*.avif binary
+*.bin binary
+*.ico binary
+*.img binary
+*.jpg binary
+*.jpeg binary
+*.kzr binary
+*.mp3 binary
+*.mp4 binary
+*.pdf binary
+*.pfu binary
+*.pem text eol=lf
+*.png binary
+*.so binary
+*.webp binary
+*.zip binary
+

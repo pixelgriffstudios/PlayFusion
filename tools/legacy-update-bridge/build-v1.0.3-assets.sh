@@ -15,6 +15,36 @@ find "$SOURCE/tools" -type f -name '*.sh' -exec chmod 0755 {} +
 install -o root -g root -m 0600 /tmp/playfusion-update-private.pem "$BUILD/private.pem"
 
 cp -a -- "$SOURCE/rootfs/." "$PAYLOAD/"
+
+# A release may be staged from a Windows checkout.  Git's Windows defaults can
+# silently turn Linux scripts, sudoers rules, systemd units and configuration
+# files into CRLF text.  A CR at the end of a shebang makes Linux look for
+# "bash\r" and the launcher exits with status 127.  Normalize UTF-8 text before
+# setting modes or signing the update; binary assets are left byte-for-byte
+# unchanged.
+python3 - "$PAYLOAD" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+changed = 0
+for path in root.rglob("*"):
+    if not path.is_file() or path.is_symlink():
+        continue
+    data = path.read_bytes()
+    if b"\0" in data:
+        continue
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    normalized = data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    if normalized != data:
+        path.write_bytes(normalized)
+        changed += 1
+print(f"Normalized LF line endings in {changed} payload files.")
+PY
+
 install -D -o root -g root -m 0755 "$LIVE_ROOT/usr/bin/kazeta-bios" \
     "$PAYLOAD/usr/bin/kazeta-bios"
 install -D -o root -g root -m 0755 \

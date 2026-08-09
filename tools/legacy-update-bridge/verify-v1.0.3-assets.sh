@@ -82,6 +82,50 @@ done < <(bsdtar -tf "$work/payload.tar.zst")
 mkdir "$work/root"
 bsdtar -xf "$work/payload.tar.zst" -C "$work/root"
 "$SOURCE/tools/verify-public-rootfs.sh" "$work/root"
+
+# Reject Windows line endings in Linux payload text.  This is a release-blocking
+# check because CRLF shebangs fail as "bash\r: No such file or directory" and
+# surface in PlayFusion as launcher status 127.
+python3 - "$work/root" <<'PY'
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+bad = []
+for path in root.rglob("*"):
+    if not path.is_file() or path.is_symlink():
+        continue
+    data = path.read_bytes()
+    if b"\0" in data:
+        continue
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    if b"\r" in data:
+        bad.append(path.relative_to(root).as_posix())
+if bad:
+    raise SystemExit("CR/CRLF text leaked into update payload:\n" + "\n".join(bad))
+PY
+
+# Parse every shipped shell launcher, not merely the top-level post-install.
+# This catches a malformed shebang body or shell syntax before signing.
+while IFS= read -r -d '' candidate; do
+    test "$(head -c 2 "$candidate")" = '#!' || continue
+    first=$(head -n 1 "$candidate")
+    case "$first" in
+        '#!'*bash*|'#! /bin/sh'|'#!/bin/sh') bash -n "$candidate" ;;
+    esac
+done < <(find "$work/root/usr/bin" "$work/root/usr/local/bin" \
+    -maxdepth 1 -type f -print0)
+
+if command -v visudo >/dev/null 2>&1; then
+    for rules in "$work/root"/etc/sudoers.d/*; do
+        test -f "$rules" || continue
+        visudo -cf "$rules" >/dev/null
+    done
+fi
+
 test "$(find "$work/root" -type f -name '*.kzr' -print -quit)" = ''
 test ! -e "$work/root/var/kazeta"
 for protected in \
@@ -98,13 +142,16 @@ done
 test -f "$work/post-install"
 bash -n "$work/post-install"
 PLAYFUSION_THEME_TEST_ONLY=1 \
+PLAYFUSION_THEME_USER=root \
+PLAYFUSION_THEME_GROUP=root \
 PLAYFUSION_THEME_TEST_ROOT="$work/theme-install-test" \
 PLAYFUSION_THEME_TEST_ARCHIVE_ROOT="$work/root/usr/share/playfusion/themes" \
     bash "$work/post-install"
 test -s "$work/theme-install-test/xbox_original/theme.toml"
 test -s "$work/theme-install-test/xbox_2_0/theme.toml"
 
-unzip -q "$LEGACY" -d "$work/legacy"
+mkdir -p "$work/legacy"
+bsdtar -xf "$LEGACY" -C "$work/legacy"
 kit="$work/legacy/PlayFusion-legacy-update-v${VERSION}"
 for name in \
     "PlayFusion-update-v${VERSION}.pfu" \
@@ -118,9 +165,12 @@ for name in \
 done
 grep -Fx 'VERSION="1.0.3"' "$kit/upgrade-to-plus.sh" >/dev/null
 bash -n "$kit/upgrade-to-plus.sh"
-cmp -s "$PACKAGE" "$kit/PlayFusion-update-v${VERSION}.pfu"
-cmp -s "$CHECKSUM" "$kit/PlayFusion-update-v${VERSION}.pfu.sha256"
-cmp -s "$SIGNATURE" "$kit/PlayFusion-update-v${VERSION}.pfu.sig"
+test "$(sha256sum "$PACKAGE" | awk '{print $1}')" = \
+    "$(sha256sum "$kit/PlayFusion-update-v${VERSION}.pfu" | awk '{print $1}')"
+test "$(sha256sum "$CHECKSUM" | awk '{print $1}')" = \
+    "$(sha256sum "$kit/PlayFusion-update-v${VERSION}.pfu.sha256" | awk '{print $1}')"
+test "$(sha256sum "$SIGNATURE" | awk '{print $1}')" = \
+    "$(sha256sum "$kit/PlayFusion-update-v${VERSION}.pfu.sig" | awk '{print $1}')"
 openssl dgst -sha256 -verify "$kit/playfusion-update-public.pem" \
     -signature "$kit/PlayFusion-update-v${VERSION}.pfu.sig" \
     "$kit/PlayFusion-update-v${VERSION}.pfu" >/dev/null

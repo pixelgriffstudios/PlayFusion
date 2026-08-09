@@ -26,6 +26,15 @@ Unresolved problems are tracked separately in
 
 ### Fixed
 
+- Rebuilt the incremental 1.0.3 update with Linux LF line endings. The
+  original Windows-staged asset placed CRLF endings in media launchers and
+  sudoers rules, causing music error 127, DVD failures, failed privileged game
+  mounts, and broken reboot actions on systems upgraded from 1.0.2.
+- Added release gates that reject CR/CRLF Linux payload text, parse every
+  shipped shell launcher, validate sudoers rules, and exercise theme archive
+  installation before an update can be signed.
+- Made the 1.0.3 post-install repair executable ownership and modes, sudoers
+  permissions, linker configuration, and required persistent services.
 - Restored the lightweight native Digital Jukebox cabinet visualizer while
   keeping projectM for fullscreen visualization.
 - Made the Data screen and active-profile badge follow the selected theme.

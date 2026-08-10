@@ -4,6 +4,19 @@ This file records user-visible changes in every public PlayFusion release.
 Unresolved problems are tracked separately in
 [`docs/KNOWN-ISSUES.md`](docs/KNOWN-ISSUES.md).
 
+## 1.0.4 - 2026-08-09
+
+### Fixed
+
+- Reissued the cumulative updater with native Linux LF line endings after the
+  original Windows-staged 1.0.3 payload placed CRLF endings in several media
+  launchers and privilege rules.
+- Restored music and Digital Jukebox playback, DVD playback, privileged game
+  mounts, reboot actions, executable ownership and modes, required services,
+  and the projectM linker configuration on systems upgraded from 1.0.2.
+- Added release-blocking verification for CRLF payload text, shell syntax,
+  sudoers rules, signatures, theme installation, and legacy bridge contents.
+
 ## 1.0.3 - 2026-08-03
 
 ### Added

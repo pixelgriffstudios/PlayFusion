@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-OUT=${1:-/var/tmp/pf-release-v103/out}
-SOURCE=${2:-/var/tmp/pf-release-v103/source}
+VERSION=${PLAYFUSION_VERSION:-1.0.3}
+VERSION_KEY=${VERSION//./}
+OUT=${1:-/var/tmp/pf-release-v${VERSION_KEY}/out}
+SOURCE=${2:-/var/tmp/pf-release-v${VERSION_KEY}/source}
 PUBLIC_KEY=${3:-/etc/playfusion-update-public.pem}
-VERSION=1.0.3
 PACKAGE="$OUT/PlayFusion-update-v${VERSION}.pfu"
 CHECKSUM="${PACKAGE}.sha256"
 SIGNATURE="${PACKAGE}.sig"
@@ -30,14 +31,14 @@ while IFS= read -r entry; do
 done < <(bsdtar -tf "$PACKAGE")
 
 bsdtar -xf "$PACKAGE" -C "$work"
-python3 - "$work/manifest.toml" <<'PY'
+python3 - "$work/manifest.toml" "$VERSION" <<'PY'
 import sys, tomllib
 with open(sys.argv[1], "rb") as handle:
     data = tomllib.load(handle)
 expected = {
     "product": "PlayFusion",
     "format": 1,
-    "version": "1.0.3",
+    "version": sys.argv[2],
     "minimum_version": "1.0.0",
     "restart": "reboot",
 }
@@ -163,7 +164,7 @@ for name in \
     playfusion-update.sudoers upgrade-to-plus.sh; do
     test -s "$kit/$name" || { printf 'Missing legacy member: %s\n' "$name" >&2; exit 1; }
 done
-grep -Fx 'VERSION="1.0.3"' "$kit/upgrade-to-plus.sh" >/dev/null
+grep -Fx "VERSION=\"${VERSION}\"" "$kit/upgrade-to-plus.sh" >/dev/null
 bash -n "$kit/upgrade-to-plus.sh"
 test "$(sha256sum "$PACKAGE" | awk '{print $1}')" = \
     "$(sha256sum "$kit/PlayFusion-update-v${VERSION}.pfu" | awk '{print $1}')"

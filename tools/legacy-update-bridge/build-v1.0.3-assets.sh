@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BUILD=/var/tmp/pf-release-v103
+VERSION=${PLAYFUSION_VERSION:-1.0.3}
+MINIMUM_VERSION=${PLAYFUSION_MINIMUM_VERSION:-1.0.0}
+VERSION_KEY=${VERSION//./}
+BUILD="/var/tmp/pf-release-v${VERSION_KEY}"
 SOURCE="$BUILD/source"
 PAYLOAD="$BUILD/payload"
 OUT="$BUILD/out"
@@ -65,7 +68,7 @@ rm -f -- \
     "$PAYLOAD/usr/bin/playfusion-game-exit-hotkey" \
     "$PAYLOAD/etc/playfusion-update-public.pem" \
     "$PAYLOAD/etc/systemd/system/playfusion-update-health.service"
-printf 'PRODUCT=PlayFusion\nVERSION=1.0.3\n' > "$PAYLOAD/etc/playfusion-release"
+printf 'PRODUCT=PlayFusion\nVERSION=%s\n' "$VERSION" > "$PAYLOAD/etc/playfusion-release"
 
 while IFS= read -r -d '' file; do
     if test "$(head -c 2 "$file")" = '#!'; then chmod 0755 "$file"; fi
@@ -76,40 +79,43 @@ chown -R root:root "$PAYLOAD"
 bash -n "$SOURCE/tools/legacy-update-bridge/post-install-v1.0.3.sh"
 chmod 0755 "$SOURCE/tools/build-playfusion-update.sh"
 "$SOURCE/tools/build-playfusion-update.sh" \
-    "$PAYLOAD" 1.0.3 1.0.0 "$BUILD/private.pem" "$OUT" \
+    "$PAYLOAD" "$VERSION" "$MINIMUM_VERSION" "$BUILD/private.pem" "$OUT" \
     "$SOURCE/tools/legacy-update-bridge/post-install-v1.0.3.sh"
 
-KIT="$OUT/PlayFusion-legacy-update-v1.0.3"
+KIT="$OUT/PlayFusion-legacy-update-v${VERSION}"
 mkdir -p "$KIT"
 for executable in upgrade-to-plus.sh; do
     install -m 0755 "$SOURCE/tools/legacy-update-bridge/$executable" "$KIT/$executable"
 done
+sed -i "s/^VERSION=\"1\.0\.3\"$/VERSION=\"${VERSION}\"/" "$KIT/upgrade-to-plus.sh"
 install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-update-helper" "$KIT/playfusion-update-helper"
 install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-update-health" "$KIT/playfusion-update-health"
 install -m 0755 "$SOURCE/rootfs/usr/bin/playfusion-game-exit-hotkey" "$KIT/playfusion-game-exit-hotkey"
 install -m 0644 "$SOURCE/rootfs/etc/systemd/system/playfusion-update-health.service" "$KIT/playfusion-update-health.service"
 install -m 0440 "$SOURCE/rootfs/etc/sudoers.d/playfusion-update" "$KIT/playfusion-update.sudoers"
 install -m 0644 "$SOURCE/rootfs/etc/playfusion-update-public.pem" "$KIT/playfusion-update-public.pem"
-cp "$OUT/PlayFusion-update-v1.0.3.pfu" \
-    "$OUT/PlayFusion-update-v1.0.3.pfu.sha256" \
-    "$OUT/PlayFusion-update-v1.0.3.pfu.sig" "$KIT/"
+cp "$OUT/PlayFusion-update-v${VERSION}.pfu" \
+    "$OUT/PlayFusion-update-v${VERSION}.pfu.sha256" \
+    "$OUT/PlayFusion-update-v${VERSION}.pfu.sig" "$KIT/"
 
 cd "$OUT"
-python3 - <<'PY'
+python3 - "$VERSION" <<'PY'
 from pathlib import Path
+import sys
 from zipfile import ZIP_DEFLATED, ZipFile
-root = Path("PlayFusion-legacy-update-v1.0.3")
-with ZipFile("PlayFusion-legacy-update-v1.0.3.zip", "w", ZIP_DEFLATED,
+version = sys.argv[1]
+root = Path(f"PlayFusion-legacy-update-v{version}")
+with ZipFile(f"PlayFusion-legacy-update-v{version}.zip", "w", ZIP_DEFLATED,
              compresslevel=6, allowZip64=True) as archive:
     for path in sorted(root.rglob("*")):
         if path.is_file(): archive.write(path, path.as_posix())
 PY
-sha256sum PlayFusion-update-v1.0.3.pfu \
-    PlayFusion-update-v1.0.3.pfu.sha256 \
-    PlayFusion-update-v1.0.3.pfu.sig \
-    PlayFusion-legacy-update-v1.0.3.zip > SHA256SUMS-v1.0.3.txt
-chmod 0644 PlayFusion-update-v1.0.3.pfu* \
-    PlayFusion-legacy-update-v1.0.3.zip SHA256SUMS-v1.0.3.txt
+sha256sum "PlayFusion-update-v${VERSION}.pfu" \
+    "PlayFusion-update-v${VERSION}.pfu.sha256" \
+    "PlayFusion-update-v${VERSION}.pfu.sig" \
+    "PlayFusion-legacy-update-v${VERSION}.zip" > "SHA256SUMS-v${VERSION}.txt"
+chmod 0644 "PlayFusion-update-v${VERSION}.pfu"* \
+    "PlayFusion-legacy-update-v${VERSION}.zip" "SHA256SUMS-v${VERSION}.txt"
 "$SOURCE/tools/verify-public-rootfs.sh" "$PAYLOAD"
-ls -lh PlayFusion-update-v1.0.3.pfu* \
-    PlayFusion-legacy-update-v1.0.3.zip SHA256SUMS-v1.0.3.txt
+ls -lh "PlayFusion-update-v${VERSION}.pfu"* \
+    "PlayFusion-legacy-update-v${VERSION}.zip" "SHA256SUMS-v${VERSION}.txt"

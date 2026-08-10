@@ -7,6 +7,19 @@ THEME_ROOT="$PERSISTENT_DATA/themes"
 THEME_USER=${PLAYFUSION_THEME_USER:-gamer}
 THEME_GROUP=${PLAYFUSION_THEME_GROUP:-gamer}
 
+# chown -R dereferences symbolic links on some paths.  ProjectM's persistent
+# preset collection intentionally contains links, and a link can be dangling
+# after a preset refresh.  Own the links themselves so one stale preset cannot
+# abort an otherwise valid OS update.
+safe_recursive_chown() {
+    local owner=$1 path
+    shift
+    for path in "$@"; do
+        test -e "$path" || test -L "$path" || continue
+        chown -hR "$owner" "$path"
+    done
+}
+
 install_theme_archive() {
     local archive=$1 folder=$2 stage entry normalized
     test -s "$archive"
@@ -36,6 +49,13 @@ if test "${PLAYFUSION_THEME_TEST_ONLY:-0}" = 1; then
     test_archives=${PLAYFUSION_THEME_TEST_ARCHIVE_ROOT:?Missing theme test archives}
     install_theme_archive "$test_archives/xbox_original-PlayFusion-optimized.zip" xbox_original
     install_theme_archive "$test_archives/xbox_2_0-PlayFusion.zip" xbox_2_0
+    # Reproduce a real console's stale ProjectM preset link.  The release must
+    # be rejected if recursive ownership handling cannot tolerate it.
+    ownership_fixture="$THEME_ROOT/.ownership-fixture"
+    install -d "$ownership_fixture"
+    ln -s missing-preset.milk "$ownership_fixture/dangling-preset.milk"
+    safe_recursive_chown "$THEME_USER:$THEME_GROUP" "$ownership_fixture"
+    test -L "$ownership_fixture/dangling-preset.milk"
     exit 0
 fi
 
@@ -54,7 +74,7 @@ elif ! test -e "$HOME_DATA"; then
     ln -s "$PERSISTENT_DATA" "$HOME_DATA"
 fi
 
-chown -R gamer:gamer /var/kazeta/user-data/kazeta-plus \
+safe_recursive_chown gamer:gamer /var/kazeta/user-data/kazeta-plus \
     /var/kazeta/state/projectm-home /var/kazeta/state/wireplumber
 
 # Reassert Linux execution and privilege metadata after the payload is merged.
